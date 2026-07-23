@@ -2745,13 +2745,14 @@ fn finish_alignment(
     let mut trace: Vec<TraceRun> = Vec::new();
     for (op, transition_id) in ops {
         let (query_advance, target_advance) = op.advances();
-        if let Some(last) = trace.last_mut()
-            && last.op == op
-            && last.transition_id == transition_id
-            && last.query_advance == query_advance
-            && last.target_advance == target_advance
-        {
-            last.repeats += 1;
+        let merge = trace.last().is_some_and(|last| {
+            last.op == op
+                && last.transition_id == transition_id
+                && last.query_advance == query_advance
+                && last.target_advance == target_advance
+        });
+        if merge {
+            trace.last_mut().expect("checked last trace run").repeats += 1;
         } else {
             trace.push(TraceRun {
                 transition_id,

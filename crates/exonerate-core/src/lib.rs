@@ -1051,13 +1051,14 @@ impl TraceFragment {
     }
     pub fn append_to(self, trace: &mut Vec<TraceRun>) {
         for atom in self.atoms.into_iter().flatten() {
-            if let Some(last) = trace.last_mut()
-                && last.op == atom.op
-                && last.transition_id == atom.transition_id
-                && last.query_advance == atom.query_advance
-                && last.target_advance == atom.target_advance
-            {
-                last.repeats += atom.repeats;
+            let merge = trace.last().is_some_and(|last| {
+                last.op == atom.op
+                    && last.transition_id == atom.transition_id
+                    && last.query_advance == atom.query_advance
+                    && last.target_advance == atom.target_advance
+            });
+            if merge {
+                trace.last_mut().expect("checked last trace run").repeats += atom.repeats;
             } else {
                 trace.push(atom);
             }
@@ -1101,10 +1102,9 @@ impl Alignment {
         for run in &self.trace {
             let op = run.op.cigar(run.query_advance, run.target_advance);
             let length = u64::from(run.query_advance.max(run.target_advance)) * run.repeats;
-            if let Some((last, count)) = ops.last_mut()
-                && *last == op
-            {
-                *count += length;
+            let merge = ops.last().is_some_and(|(last, _)| *last == op);
+            if merge {
+                ops.last_mut().expect("checked last CIGAR run").1 += length;
             } else {
                 ops.push((op, length));
             }
@@ -1144,13 +1144,16 @@ impl Alignment {
         for run in &self.trace {
             let op = run.op.cigar(run.query_advance, run.target_advance);
             let length = u64::from(run.query_advance.max(run.target_advance)) * run.repeats;
-            if let Some((last, count, query_advance, target_advance)) = ops.last_mut()
-                && *last == op
-                && (op != 'M'
-                    || (*query_advance == run.query_advance
-                        && *target_advance == run.target_advance))
-            {
-                *count += length;
+            let merge = ops
+                .last()
+                .is_some_and(|(last, _, query_advance, target_advance)| {
+                    *last == op
+                        && (op != 'M'
+                            || (*query_advance == run.query_advance
+                                && *target_advance == run.target_advance))
+                });
+            if merge {
+                ops.last_mut().expect("checked last CIGAR run").1 += length;
             } else {
                 ops.push((op, length, run.query_advance, run.target_advance));
             }
@@ -3289,13 +3292,14 @@ fn traceback(
     let mut trace: Vec<TraceRun> = Vec::new();
     for (op, transition_id) in ops {
         let (query_advance, target_advance) = op.advances();
-        if let Some(last) = trace.last_mut()
-            && last.op == op
-            && last.transition_id == transition_id
-            && last.query_advance == query_advance
-            && last.target_advance == target_advance
-        {
-            last.repeats += 1;
+        let merge = trace.last().is_some_and(|last| {
+            last.op == op
+                && last.transition_id == transition_id
+                && last.query_advance == query_advance
+                && last.target_advance == target_advance
+        });
+        if merge {
+            trace.last_mut().expect("checked last trace run").repeats += 1;
         } else {
             trace.push(TraceRun {
                 transition_id,
@@ -10953,13 +10957,14 @@ fn align_protein_to_dna_direct(
         reversed_raw_fragments.push(raw_fragment);
         i -= parent.query_advance as usize;
         j -= parent.target_advance as usize;
-        if let Some(last) = trace.last_mut()
-            && last.op == parent.op
-            && last.transition_id == parent.transition_id
-            && last.query_advance == parent.query_advance
-            && last.target_advance == parent.target_advance
-        {
-            last.repeats += 1;
+        let merge = trace.last().is_some_and(|last| {
+            last.op == parent.op
+                && last.transition_id == parent.transition_id
+                && last.query_advance == parent.query_advance
+                && last.target_advance == parent.target_advance
+        });
+        if merge {
+            trace.last_mut().expect("checked last trace run").repeats += 1;
         } else {
             trace.push(TraceRun {
                 transition_id: parent.transition_id,

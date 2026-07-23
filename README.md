@@ -1,73 +1,72 @@
 # exonerate-rs
 
-GPL-3.0-only Rust reimplementation of Exonerate.  The current vertical slice
-implements exhaustive DNA and protein `ungapped` and `affine:{global,bestfit,local,overlap}`
-alignment for FASTA input, with deterministic traceback and sugar/cigar/vulgar/GFF3 reports.  Protein queries can also be searched directly against DNA (`--querytype protein
---targettype dna`) with codon-affine gaps and target-side frameshift transitions;
-`protein2dna` is the intron-free model.  `protein2genome` is available for protein-to-genome local alignment with phase 0/1/2 introns, the upstream splice PSSM, and canonical split-codon/intron traceback.  `est2genome` is also available for local DNA-to-genome alignment with affine gaps, bounded target introns, upstream splice PSSMs, both target strands, and canonical intron traceback. A generic C4 graph executor is available as a library API, including bounded query-, target-, and joint-intron long states and target phase 0/1/2 codon shadows. NER spans are supported, as are `ungapped:trans` and `protein2genome:bestfit`. Target, query, and joint split-codon shadows are implemented in the generic executor. DNA `affine:local` uses k-mer seed/diagonal-cluster/exact-refine search by default. DNA genomic models (`est2genome`, `coding2genome`, `cdna2genome`, and `genome2genome`) use intron-aware padded target regions before unchanged exact DP. `protein2genome` and `protein2genome:bestfit` use translated amino-acid k-mers across all three frames of each requested target strand. `-E` selects exhaustive DP.
+[![CI](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml)
 
-For generic affine models, DNA versus protein input is inferred from FASTA unless
-`--querytype` or `--targettype` is supplied. The CLI follows upstream defaults:
-`--score 100` and enabled Waterman--Eggert `--subopt`; use `--score 0 --subopt no`
-when a single low-scoring local alignment is wanted. Long FASTA inputs can be
-partitioned on complete record boundaries with `--querychunkid` / `--querychunktotal`
-or `--targetchunkid` / `--targetchunktotal`.
+Exonerate 2.4.0 的 Rust 重实现。目标是在保持得分、坐标、路径和主要
+CLI 输出兼容的前提下，提供安全、可测试的精确比对与低内存执行路径。
 
-Clone with the upstream behavioural oracle used by the regression tests:
+## 支持范围
+
+- 基础模型：`ungapped`、`ungapped:trans`、`affine:{global,bestfit,local,overlap}`。
+- 生物模型：`ner`、`est2genome`、`protein2dna`、
+  `protein2genome`、`coding2coding`、`coding2genome`、
+  `cdna2genome`、`genome2genome`，以及两个 protein best-fit 变体。
+- DNA、蛋白质、翻译、frameshift、phase 0/1/2 intron、split codon。
+- sugar、cigar、vulgar、pretty alignment、RYO 和项目自有 GFF3。
+- exact DP、启发式候选区域和 checkpoint traceback。
+
+GFF2 不在项目范围内。
+
+## 构建与检查
+
+项目固定使用 Rust 1.87.0：
 
 ```bash
 git clone --recurse-submodules https://github.com/GUIBA-EX/exonerate_rust.git
 cd exonerate_rust
-cargo test --workspace
+cargo build --release --locked
+cargo test --workspace --all-targets --locked
 ```
+
+本地执行与 CI 相同的检查：
 
 ```bash
-cargo run --release -p exonerate -- --model affine:local query.fa target.fa
-
-# direct protein-to-DNA alignment (codon gaps and frameshifts)
-cargo run --release -p exonerate -- --model affine:local \
-  --querytype protein --targettype dna protein.fa target-dna.fa
-
-# cDNA-to-genome alignment (5′ UTR, coding region, 3′ UTR in one DP lattice)
-cargo run --release -p exonerate -- --model cdna2genome \
-  --minintron 30 --maxintron 200000 cdna.fa genome.fa
-
-# coding-DNA-to-genome alignment (codon gaps, frameshifts, phase 0/1/2 introns)
-cargo run --release -p exonerate -- --model coding2genome \
-  --minintron 30 --maxintron 200000 coding.fa genome.fa
-
-# intron-aware protein-to-genome alignment (phase 0/1/2 introns)
-cargo run --release -p exonerate -- --model protein2genome \
-  --minintron 30 --maxintron 200000 protein.fa genome.fa
-
-# local EST-to-genome alignment; intron controls are optional
-cargo run --release -p exonerate -- --model est2genome \
-  --minintron 30 --maxintron 200000 est.fa genome.fa
-
-# emit GFF3 match / match_part records from the traceback
-cargo run --release -p exonerate -- --model est2genome \
-  --showvulgar no --showgff yes est.fa genome.fa
-
-# RYO supports definitions, coding ranges, equivalenced counts and percentages
-cargo run --release -p exonerate -- --model coding2genome \
-  --ryo '%qi %qd %qcb %qce %et %ei %pi\n' coding.fa genome.fa
-
-# Use reverse-oriented coordinates instead of the default forward-reference form
-cargo run --release -p exonerate -- --model protein2genome \
-  --forwardcoordinates no protein.fa genome.fa
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
+cargo test --workspace --doc --locked
+RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 ```
 
-## Heuristic DNA search
+## 使用
 
-`affine:local` uses exact k-mer seeds to select a padded candidate rectangle, then runs the unchanged exact Viterbi/traceback kernel inside that rectangle. Use `-E` or `--exhaustive` to force the full matrix. `--wordlen`, `--seedpadding`, and `--seedrepeat` control seeding; ambiguous or seedless inputs fall back to exhaustive alignment.
+```bash
+# DNA 局部比对
+cargo run --release -p exonerate -- \
+  --model affine:local query.fa target.fa
 
-On the checked 3,000 x 5,000 nt planted-alignment fixture, the release build produced the identical `M 800 800` vulgar path in 0.02 s and 28,116 KiB maximum RSS, versus 0.20 s and 221,816 KiB for `-E`. These figures are regression evidence, not a cross-machine performance guarantee.
+# 蛋白质到基因组
+cargo run --release -p exonerate -- \
+  --model protein2genome protein.fa genome.fa
 
-## DP memory planning
+# cDNA 到基因组
+cargo run --release -p exonerate -- \
+  --model cdna2genome --minintron 30 cdna.fa genome.fa
 
-`-D` / `--dpmemory` takes a MiB planning budget. For affine models, `est2genome`, `protein2genome`, `coding2genome`, and `cdna2genome`, an exhaustive run switches to exact checkpointed traceback when the full matrix estimate exceeds that budget. The planner minimizes its estimated checkpoint footprint; if even one rolling DP row cannot fit (including `-D 0`), it still runs the minimum-footprint checkpoint plan. Exhaustive `genome2genome` likewise feeds the budget to its checkpoint-block planner, uses rolling score rows, and replays compact parent blocks; it currently rebuilds the required prefix for each block, trading additional CPU time for bounded parent memory. Thus `-D 0` is a deterministic low-memory-path selector, not a literal zero-byte or RSS hard cap.
+# 强制精确 DP，并使用低内存计划
+cargo run --release -p exonerate -- \
+  --model genome2genome --exhaustive yes --dpmemory 16 query.fa target.fa
+```
 
-See [`exonerate.md`](exonerate.md) for the staged architecture,
-[`COMPATIBILITY.md`](COMPATIBILITY.md) for the implemented compatibility
-surface, and [`ORACLE_MATRIX.md`](ORACLE_MATRIX.md) for the permanent upstream
-CLI regression inventory.
+CLI 默认 `--score 100`、`--subopt yes`。`-E`/`--exhaustive` 强制完整
+DP；`--dpmemory` 是 DP 规划预算，不是进程 RSS 硬上限。内部坐标为
+零基、半开区间；默认报告正向参考坐标。
+
+## 文档
+
+- [架构](exonerate.md)
+- [兼容范围](COMPATIBILITY.md)
+- [开发状态](DEVELOPMENT_STATUS.md)
+- [命令行基准覆盖](ORACLE_MATRIX.md)
+
+许可证：GPL-3.0-only。

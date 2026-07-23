@@ -1,58 +1,39 @@
-# CLI oracle matrix
+# 命令行基准覆盖
 
-This matrix tracks byte-for-byte comparisons against the locally built
-upstream 2.4.0 executable at `upstream/src/program/exonerate`. It is a coverage
-inventory, not a claim that a model is globally compatible.
+`是`表示已有永久回归与 upstream 2.4.0 对照；`部分`表示只覆盖了代表性
+场景；`否`表示尚无永久基准。
 
-Legend:
+| 模型 | 基础输出 | 链方向 | 多记录 | 阈值/Best-N | 次优路径 | 低内存 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `ungapped` | 是 | 部分 | 否 | 部分 | 是 | 不适用 |
+| `ungapped:trans` | 是 | 部分 | 是 | 是 | 部分 | 不适用 |
+| `affine:global` | 是 | 部分 | 否 | 否 | 否 | 部分 |
+| `affine:bestfit` | 是 | 部分 | 否 | 否 | 否 | 部分 |
+| `affine:local` | 是 | 部分 | 是 | 是 | 是 | 部分 |
+| `affine:overlap` | 是 | 部分 | 否 | 否 | 否 | 部分 |
+| `protein2dna` | 是 | 是 | 否 | 部分 | 部分 | 不适用 |
+| `protein2dna:bestfit` | 是 | 部分 | 否 | 否 | 部分 | 不适用 |
+| `est2genome` | 是 | 部分 | 是 | 是 | 部分 | 是 |
+| `protein2genome` | 是 | 是 | 是 | 部分 | 部分 | 是 |
+| `protein2genome:bestfit` | 是 | 部分 | 否 | 否 | 部分 | 部分 |
+| `coding2coding` | 是 | 不适用 | 否 | 否 | 是 | 不适用 |
+| `coding2genome` | 是 | 是 | 是 | 是 | 是 | 是 |
+| `cdna2genome` | 是 | 是 | 是 | 是 | 部分 | 是 |
+| `genome2genome` | 是 | 是 | 是 | 是 | 部分 | 是 |
+| `ner` | 是 | 部分 | 是 | 是 | 部分 | 不适用 |
 
-- **yes**: a permanent CLI regression pins the upstream result.
-- **partial**: at least one case is pinned, but important variants remain.
-- **no**: no permanent CLI oracle covers this dimension yet.
-- **n/a**: the dimension does not apply to the current implementation.
+## 跨模型检查
 
-| Model | Base reports | Strands | Multi-record / order | Thresholds / `bestn` | Suboptimal order | Pretty / RYO | `-D` equivalence |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| `ungapped` | yes | no | no | partial | yes | no | n/a |
-| `ungapped:trans` | yes | partial | yes | yes | no | partial | n/a |
-| `affine:global` | yes | partial | no | no | n/a | partial | partial |
-| `affine:bestfit` | yes | partial | no | no | n/a | partial | partial |
-| `affine:local` | yes | partial | yes | yes | yes | partial | partial |
-| `affine:overlap` | yes | partial | no | no | n/a | partial | partial |
-| `protein2dna` | yes | yes | no | no | partial | partial | n/a |
-| `protein2dna:bestfit` | yes | partial | no | no | partial | partial | n/a |
-| `est2genome` | yes | partial | yes | yes | no | partial | yes |
-| `protein2genome` | yes | yes | yes | partial | partial | yes | yes |
-| `protein2genome:bestfit` | yes | partial | no | no | partial | partial | partial |
-| `coding2coding` | yes | n/a | no | no | yes | partial | n/a |
-| `coding2genome` | yes | yes | yes | yes | yes | yes | yes |
-| `cdna2genome` | yes | yes | yes | yes | no | yes | yes |
-| `genome2genome` | yes | yes | yes | yes | partial | yes | yes |
-| `ner` | yes | partial | yes | yes | no | partial | n/a |
+| 功能 | 状态 |
+| --- | --- |
+| help、version、别名 | 是 |
+| FASTA byte chunk | 是 |
+| 反序 ID 的多记录排序 | 是 |
+| 默认 score/subopt | 部分 |
+| 非法参数与类型冲突 | 部分 |
+| pretty 与通用 RYO | 部分 |
+| 页眉/页脚 | 否 |
+| GFF2 | 不在范围内 |
 
-## Cross-model CLI surfaces
-
-| Surface | Coverage | Permanent regression |
-| --- | --- | --- |
-| Help, version, and aliases | yes | `help_and_version_aliases_are_available_without_fasta_inputs` |
-| FASTA byte chunking | yes | `fasta_byte_chunks_match_the_upstream_record_boundaries` |
-| Reversed-ID multi-record `bestn` order | yes | `bestn_multi_record_order_matches_the_upstream_oracle` |
-| Translated multi-record `bestn` order | yes | `protein2genome_bestn_multi_record_order_matches_the_upstream_oracle` |
-| Composed multi-record order and score boundaries | yes | `composed_multi_record_order_and_score_boundaries_match_the_upstream_oracle` |
-| EST multi-record order and score boundary | yes | `est2genome_multi_record_order_and_score_boundary_match_the_upstream_oracle` |
-| NER and translated multi-record order | yes | `ner_and_ungapped_trans_multi_record_order_match_the_upstream_oracle` |
-| Invalid model/type combinations | partial | `invalid_cli_options_and_ryo_tokens_fail_explicitly` |
-| Default score and suboptimal mode | partial | `subopt_is_enabled_by_default_like_the_upstream_cli` |
-| Boolean syntax | partial | `exhaustive_accepts_upstream_boolean_syntax` |
-| GFF2 wrapper output | out of scope | current output remains project-specific GFF3 |
-| Headers and footer | no | none |
-
-## Next oracle batches
-
-1. Exact score and percent boundary cases for the remaining scoring families.
-2. `bestn` cutoff ties and suboptimal ordering for `est2genome`,
-   `protein2genome`, `cdna2genome`, `genome2genome`, `ner`, and
-   `ungapped:trans`.
-3. Pretty alignment and common RYO fields for every model family.
-4. Upstream process headers/footer. GFF2 compatibility is explicitly out of
-   scope.
+下一批优先补 affine 非 local scope、各模型 tie order、pretty/RYO 和
+header/footer。所有 fixture 必须小、确定且可在 CI 中稳定运行。
