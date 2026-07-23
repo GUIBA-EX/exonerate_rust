@@ -1,14 +1,19 @@
 use exonerate_core::{
     Alignment, HeuristicConfig, IntronScoring, Model, RawStep, Scoring, Sequence, Strand,
     align_cdna_to_genome_database, align_cdna_to_genome_database_heuristic,
-    align_coding_to_genome_database, align_coding_to_genome_database_heuristic,
-    align_coding2coding_database, align_database, align_database_heuristic,
-    align_database_suboptimal, align_est2genome_database, align_est2genome_database_heuristic,
-    align_genome_to_genome_database, align_genome_to_genome_database_heuristic, align_ner_database,
-    align_protein_database, align_protein_to_dna_database,
+    align_cdna_to_genome_database_suboptimal, align_coding_to_genome_database,
+    align_coding_to_genome_database_heuristic, align_coding_to_genome_database_suboptimal,
+    align_coding2coding_database, align_coding2coding_database_suboptimal,
+    align_database_heuristic, align_database_suboptimal, align_database_with_dp_memory,
+    align_est2genome_database, align_est2genome_database_heuristic,
+    align_est2genome_database_suboptimal, align_genome_to_genome_database,
+    align_genome_to_genome_database_heuristic, align_genome_to_genome_database_suboptimal,
+    align_ner_database, align_ner_database_suboptimal, align_protein_database_with_dp_memory,
+    align_protein_to_dna_database, align_protein_to_dna_database_suboptimal,
     align_protein_to_genome_bestfit_database, align_protein_to_genome_bestfit_database_heuristic,
     align_protein_to_genome_database, align_protein_to_genome_database_heuristic,
-    align_ungapped_translated_database, dna_self_score, protein_self_score, read_fasta,
+    align_protein_to_genome_database_suboptimal, align_ungapped_translated_database,
+    align_ungapped_translated_database_suboptimal, dna_self_score, protein_self_score, read_fasta,
     reverse_complement, translated_self_score,
 };
 use std::collections::HashMap;
@@ -16,7 +21,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: exonerate-rs [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive] [--revcomp yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
+    "Usage: exonerate-rs [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive] [--revcomp yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
 }
 fn yes_no(value: &str) -> Result<bool, String> {
     match value {
@@ -126,7 +131,10 @@ fn render_ryo_plain(
             'm' => output.push_str(model),
             'g' => output.push(strand_symbol(alignment.target_strand)),
             'S' => output.push_str(alignment.sugar().strip_prefix("sugar: ").unwrap()),
-            'C' => output.push_str(&report_tail(&alignment.cigar())),
+            'C' => {
+                output.push(' ');
+                output.push_str(&report_tail(&alignment.cigar()));
+            }
             'V' => output.push_str(&report_tail(&alignment.vulgar())),
             'q' | 't' => {
                 let is_query = token == 'q';
@@ -182,6 +190,233 @@ fn render_ryo_plain(
 }
 
 fn transition_metadata(model: &str, transition_id: u16) -> (&'static str, &'static str) {
+    if model == "cdna2genome" {
+        return match transition_id {
+            0 | 300 | 400 => ("start to match", "none"),
+            1 | 301 | 401 => ("match", "match"),
+            2 | 302 | 402 => ("match to insert", "gap"),
+            3 | 303 | 403 => ("insert", "gap"),
+            4 | 304 | 404 => ("insert to match", "none"),
+            5 | 305 | 405 => ("match to delete", "gap"),
+            6 | 306 | 406 => ("delete", "gap"),
+            7 | 307 | 407 => ("delete to match", "none"),
+            8 => ("frameshift open 1 query", "frameshift"),
+            9 => ("frameshift open 2 query", "frameshift"),
+            10 => ("frameshift close 0 query", "none"),
+            11 => ("frameshift close 3 query", "frameshift"),
+            12 => ("frameshift open 1 target", "frameshift"),
+            13 => ("frameshift open 2 target", "frameshift"),
+            14 => ("frameshift close 0 target", "none"),
+            15 => ("frameshift close 3 target", "frameshift"),
+            16 | 308 | 408 | 320 | 321 => ("match to end", "none"),
+            310 | 410 => ("(START) to intron forward", "5'ss"),
+            311 | 411 => ("target intron loop forward", "intron"),
+            312 | 412 => ("intron forward to (END)", "3'ss"),
+            101 => ("(START) to phase1pre phase target intron -T", "split codon"),
+            102 => ("(START) to phase2pre phase target intron -T", "split codon"),
+            110 => ("(START) to intron 0:0 phase target intron -T", "5'ss"),
+            111 => ("(START) to intron 1:2 phase target intron -T", "5'ss"),
+            112 => ("(START) to intron 2:1 phase target intron -T", "5'ss"),
+            120 => ("target intron loop 0:0 phase target intron -T", "intron"),
+            121 => ("target intron loop 1:2 phase target intron -T", "intron"),
+            122 => ("target intron loop 2:1 phase target intron -T", "intron"),
+            130 => ("intron 0:0 phase target intron -T to (END)", "3'ss"),
+            131 => ("intron 1:2 phase target intron -T to (END)", "3'ss"),
+            132 => ("intron 2:1 phase target intron -T to (END)", "3'ss"),
+            140 => ("phase0post phase target intron -T to (END)", "match"),
+            141 => ("phase1post phase target intron -T to (END)", "split codon"),
+            142 => ("phase2post phase target intron -T to (END)", "split codon"),
+            _ => ("unknown", "none"),
+        };
+    }
+    if model == "genome2genome" {
+        return match transition_id {
+            29 => ("start to match", "none"),
+            30 | 51 => ("match", "match"),
+            31 | 52 => ("match to insert", "gap"),
+            32 | 54 => ("insert", "gap"),
+            33 | 53 => ("match to delete", "gap"),
+            34 | 55 => ("delete", "gap"),
+            35 | 59 => ("insert to match", "none"),
+            36 | 79 => ("delete to match", "none"),
+            39 | 89 | 90 => ("match to end", "none"),
+            40 => ("(START) to intron forward", "5'ss"),
+            41 => ("target intron loop forward", "intron"),
+            42 => ("intron forward to (END)", "3'ss"),
+            43 => ("(START) to intron query", "5'ss"),
+            44 => ("query intron loop query", "intron"),
+            45 => ("intron query to (END)", "3'ss"),
+            46 => ("(START) to intron joint", "5'ss"),
+            47 => ("query intron loop joint", "intron"),
+            49 => ("target intron loop joint", "intron"),
+            48 => ("intron joint to (END)", "3'ss"),
+            50 | 58 => ("match to end", "none"),
+            80 => ("frameshift open 1 query", "frameshift"),
+            81 => ("frameshift open 2 query", "frameshift"),
+            82 => ("frameshift close 0 query", "none"),
+            83 => ("frameshift close 3 query", "frameshift"),
+            84 => ("frameshift open 1 target", "frameshift"),
+            85 => ("frameshift open 2 target", "frameshift"),
+            86 => ("frameshift close 0 target", "none"),
+            87 => ("frameshift close 3 target", "frameshift"),
+            100 => ("(START) to phase0pre phase target intron -T", "match"),
+            101 => ("(START) to phase1pre phase target intron -T", "split codon"),
+            102 => ("(START) to phase2pre phase target intron -T", "split codon"),
+            110 => ("(START) to intron 0:0 phase target intron -T", "5'ss"),
+            111 => ("(START) to intron 1:2 phase target intron -T", "5'ss"),
+            112 => ("(START) to intron 2:1 phase target intron -T", "5'ss"),
+            120 => ("target intron loop 0:0 phase target intron -T", "intron"),
+            121 => ("target intron loop 1:2 phase target intron -T", "intron"),
+            122 => ("target intron loop 2:1 phase target intron -T", "intron"),
+            130 => ("intron 0:0 phase target intron -T to (END)", "3'ss"),
+            131 => ("intron 1:2 phase target intron -T to (END)", "3'ss"),
+            132 => ("intron 2:1 phase target intron -T to (END)", "3'ss"),
+            140 => ("phase0post phase target intron -T to (END)", "match"),
+            141 => ("phase1post phase target intron -T to (END)", "split codon"),
+            142 => ("phase2post phase target intron -T to (END)", "split codon"),
+            150 => ("(START) to phase0pre phase query Q-", "match"),
+            151 => ("(START) to phase1pre phase query Q-", "split codon"),
+            152 => ("(START) to phase2pre phase query Q-", "split codon"),
+            160 => ("(START) to intron 0:0 phase query Q-", "5'ss"),
+            161 => ("(START) to intron 1:2 phase query Q-", "5'ss"),
+            162 => ("(START) to intron 2:1 phase query Q-", "5'ss"),
+            170 => ("query intron loop 0:0 phase query Q-", "intron"),
+            171 => ("query intron loop 1:2 phase query Q-", "intron"),
+            172 => ("query intron loop 2:1 phase query Q-", "intron"),
+            180 => ("intron 0:0 phase query Q- to (END)", "3'ss"),
+            181 => ("intron 1:2 phase query Q- to (END)", "3'ss"),
+            182 => ("intron 2:1 phase query Q- to (END)", "3'ss"),
+            190 => ("phase0post phase query Q- to (END)", "match"),
+            191 => ("phase1post phase query Q- to (END)", "split codon"),
+            192 => ("phase2post phase query Q- to (END)", "split codon"),
+            200 => ("(START) to phase0pre phase joint QT", "match"),
+            201 => ("(START) to phase1pre phase joint QT", "split codon"),
+            202 => ("(START) to phase2pre phase joint QT", "split codon"),
+            210 => ("(START) to intron 0:0 phase joint QT", "5'ss"),
+            211 => ("(START) to intron 1:2 phase joint QT", "5'ss"),
+            212 => ("(START) to intron 2:1 phase joint QT", "5'ss"),
+            220 => ("query intron loop 0:0 phase joint QT", "intron"),
+            221 => ("query intron loop 1:2 phase joint QT", "intron"),
+            222 => ("query intron loop 2:1 phase joint QT", "intron"),
+            230 => ("target intron loop 0:0 phase joint QT", "intron"),
+            231 => ("target intron loop 1:2 phase joint QT", "intron"),
+            232 => ("target intron loop 2:1 phase joint QT", "intron"),
+            240 => ("intron 0:0 phase joint QT to (END)", "3'ss"),
+            241 => ("intron 1:2 phase joint QT to (END)", "3'ss"),
+            242 => ("intron 2:1 phase joint QT to (END)", "3'ss"),
+            250 => ("phase0post phase joint QT to (END)", "match"),
+            251 => ("phase1post phase joint QT to (END)", "split codon"),
+            252 => ("phase2post phase joint QT to (END)", "split codon"),
+            _ => ("unknown", "none"),
+        };
+    }
+    if model == "coding2genome" {
+        return match transition_id {
+            0 => ("start to match", "none"),
+            1 => ("match", "match"),
+            2 => ("match to insert", "gap"),
+            3 => ("insert", "gap"),
+            4 => ("insert to match", "none"),
+            5 => ("match to delete", "gap"),
+            6 => ("delete", "gap"),
+            7 => ("delete to match", "none"),
+            8 => ("frameshift open 1 query", "frameshift"),
+            9 => ("frameshift open 2 query", "frameshift"),
+            10 => ("frameshift close 0 query", "none"),
+            11 => ("frameshift close 3 query", "frameshift"),
+            12 => ("frameshift open 1 target", "frameshift"),
+            13 => ("frameshift open 2 target", "frameshift"),
+            14 => ("frameshift close 0 target", "none"),
+            15 => ("frameshift close 3 target", "frameshift"),
+            16 => ("match to end", "none"),
+            101 => ("(START) to phase1pre phase target intron -T", "split codon"),
+            102 => ("(START) to phase2pre phase target intron -T", "split codon"),
+            110 => ("(START) to intron 0:0 phase target intron -T", "5'ss"),
+            111 => ("(START) to intron 1:2 phase target intron -T", "5'ss"),
+            112 => ("(START) to intron 2:1 phase target intron -T", "5'ss"),
+            120 => ("target intron loop 0:0 phase target intron -T", "intron"),
+            121 => ("target intron loop 1:2 phase target intron -T", "intron"),
+            122 => ("target intron loop 2:1 phase target intron -T", "intron"),
+            130 => ("intron 0:0 phase target intron -T to (END)", "3'ss"),
+            131 => ("intron 1:2 phase target intron -T to (END)", "3'ss"),
+            132 => ("intron 2:1 phase target intron -T to (END)", "3'ss"),
+            140 => ("phase0post phase target intron -T to (END)", "match"),
+            141 => ("phase1post phase target intron -T to (END)", "split codon"),
+            142 => ("phase2post phase target intron -T to (END)", "split codon"),
+            _ => ("unknown", "none"),
+        };
+    }
+    if model == "est2genome" {
+        return match transition_id {
+            0 => ("start to match forward", "none"),
+            1 => ("match forward", "match"),
+            2 => ("match to insert forward", "gap"),
+            3 => ("match to delete forward", "gap"),
+            4 => ("insert forward", "gap"),
+            5 => ("delete forward", "gap"),
+            6 => ("(START) to intron forward", "5'ss"),
+            7 => ("target intron loop forward", "intron"),
+            8 => ("intron forward to (END)", "3'ss"),
+            9 => ("insert to match forward", "none"),
+            10 => ("delete to match forward", "none"),
+            11 => ("match to end forward", "none"),
+            _ => ("unknown", "none"),
+        };
+    }
+    if model.starts_with("protein2genome") {
+        return match transition_id {
+            0 => ("start to match", "none"),
+            1 => ("match", "match"),
+            2 => ("match to insert", "gap"),
+            3 => ("match to delete", "gap"),
+            4 => ("insert", "gap"),
+            5 => ("delete", "gap"),
+            6 => ("insert to match", "none"),
+            7 => ("delete to match", "none"),
+            8 => ("frameshift open 1 p2g", "frameshift"),
+            9 => ("frameshift open 2 p2g", "frameshift"),
+            10 => ("frameshift close 0 p2g", "none"),
+            11 => ("frameshift close 3 p2g", "frameshift"),
+            12 => ("match to end", "none"),
+            101 => ("(START) to phase1pre phase-T", "split codon"),
+            102 => ("(START) to phase2pre phase-T", "split codon"),
+            110 => ("(START) to intron 0:0 phase-T", "5'ss"),
+            111 => ("(START) to intron 1:2 phase-T", "5'ss"),
+            112 => ("(START) to intron 2:1 phase-T", "5'ss"),
+            120 => ("target intron loop 0:0 phase-T", "intron"),
+            121 => ("target intron loop 1:2 phase-T", "intron"),
+            122 => ("target intron loop 2:1 phase-T", "intron"),
+            130 => ("intron 0:0 phase-T to (END)", "3'ss"),
+            131 => ("intron 1:2 phase-T to (END)", "3'ss"),
+            132 => ("intron 2:1 phase-T to (END)", "3'ss"),
+            140 => ("phase0post phase-T to (END)", "match"),
+            141 => ("phase1post phase-T to (END)", "split codon"),
+            142 => ("phase2post phase-T to (END)", "split codon"),
+            _ => ("unknown", "none"),
+        };
+    }
+    if model.starts_with("coding2coding") {
+        return match transition_id {
+            0 => ("start to match", "none"),
+            1 => ("match", "match"),
+            2 => ("match to insert", "gap"),
+            3 => ("insert", "gap"),
+            4 => ("insert to match", "none"),
+            5 => ("match to delete", "gap"),
+            6 => ("delete", "gap"),
+            7 => ("delete to match", "none"),
+            8 => ("frameshift open 1 query", "frameshift"),
+            9 => ("frameshift open 2 query", "frameshift"),
+            10 => ("frameshift close 0 query", "none"),
+            11 => ("frameshift close 3 query", "frameshift"),
+            12 => ("frameshift open 1 target", "frameshift"),
+            13 => ("frameshift open 2 target", "frameshift"),
+            14 => ("frameshift close 0 target", "none"),
+            15 => ("frameshift close 3 target", "frameshift"),
+            16 => ("match to end", "none"),
+            _ => ("unknown", "none"),
+        };
+    }
     if model.starts_with("protein2dna") {
         return match transition_id {
             0 => ("start to match", "none"),
@@ -437,6 +672,7 @@ fn run() -> Result<(), String> {
     let mut show_alignment = false;
     let mut subopt = false;
     let mut exhaustive = false;
+    let mut dp_memory_mb = 32_usize;
     let mut heuristic = HeuristicConfig::default();
     let mut files = Vec::new();
     while let Some(arg) = args.next() {
@@ -613,6 +849,13 @@ fn run() -> Result<(), String> {
             "-Q" | "--querytype" => query_type = args.next().ok_or("missing query type")?,
             "-T" | "--targettype" => target_type = args.next().ok_or("missing target type")?,
             "-E" | "--exhaustive" => exhaustive = true,
+            "-D" | "--dpmemory" => {
+                dp_memory_mb = args
+                    .next()
+                    .ok_or("missing DP memory limit")?
+                    .parse()
+                    .map_err(|_| "invalid DP memory limit")?
+            }
             "--score" => {
                 min_score = Some(
                     args.next()
@@ -698,10 +941,90 @@ fn run() -> Result<(), String> {
             && query_type == "dna"
             && target_type == "dna"
             && model == Model::Local;
-        if !plain_dna_local {
-            return Err("suboptimal enumeration currently requires DNA affine:local".into());
+        let protein_dna = !ungapped_translated
+            && !ner
+            && !coding2coding
+            && !genome2genome
+            && !cdna2genome
+            && !coding2genome
+            && !protein2genome
+            && !protein2genome_bestfit
+            && !est2genome
+            && query_type == "protein"
+            && target_type == "dna"
+            && matches!(model, Model::Local | Model::BestFit);
+        if ungapped_translated {
+            align_ungapped_translated_database_suboptimal(
+                &q,
+                &t,
+                scoring,
+                min_score.unwrap_or(100),
+                both,
+            )
+        } else if ner {
+            align_ner_database_suboptimal(
+                &q,
+                &t,
+                scoring,
+                min_ner,
+                max_ner,
+                ner_open,
+                min_score.unwrap_or(100),
+                both,
+            )
+        } else if est2genome {
+            align_est2genome_database_suboptimal(&q, &t, intron, min_score.unwrap_or(100), both)
+        } else if coding2coding {
+            align_coding2coding_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
+        } else if genome2genome {
+            align_genome_to_genome_database_suboptimal(
+                &q,
+                &t,
+                scoring,
+                intron,
+                min_score.unwrap_or(100),
+            )
+        } else if cdna2genome {
+            align_cdna_to_genome_database_suboptimal(
+                &q,
+                &t,
+                scoring,
+                intron,
+                min_score.unwrap_or(100),
+            )
+        } else if coding2genome {
+            align_coding_to_genome_database_suboptimal(
+                &q,
+                &t,
+                scoring,
+                intron,
+                min_score.unwrap_or(100),
+                both,
+            )
+        } else if protein2genome || protein2genome_bestfit {
+            align_protein_to_genome_database_suboptimal(
+                &q,
+                &t,
+                scoring,
+                intron,
+                min_score.unwrap_or(100),
+                both,
+                protein2genome_bestfit,
+            )
+        } else if protein_dna {
+            align_protein_to_dna_database_suboptimal(
+                &q,
+                &t,
+                model,
+                scoring,
+                min_score.unwrap_or(100),
+                both,
+            )
+        } else if plain_dna_local {
+            align_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
+        } else {
+            return Err("suboptimal enumeration is not implemented for this model".into());
         }
-        align_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
     } else if ungapped_translated {
         align_ungapped_translated_database(&q, &t, scoring, both)
     } else if ner {
@@ -751,8 +1074,12 @@ fn run() -> Result<(), String> {
             ("dna", "dna") if model == Model::Local && !exhaustive => {
                 align_database_heuristic(&q, &t, model, scoring, both, heuristic)
             }
-            ("dna", "dna") => align_database(&q, &t, model, scoring, both),
-            ("protein", "protein") => align_protein_database(&q, &t, model, scoring),
+            ("dna", "dna") => {
+                align_database_with_dp_memory(&q, &t, model, scoring, both, dp_memory_mb)
+            }
+            ("protein", "protein") => {
+                align_protein_database_with_dp_memory(&q, &t, model, scoring, dp_memory_mb)
+            }
             ("protein", "dna") => align_protein_to_dna_database(&q, &t, model, scoring, both),
             _ => {
                 return Err(
@@ -824,7 +1151,7 @@ fn run() -> Result<(), String> {
     } else if protein2genome_bestfit {
         "protein2genome:bestfit".to_owned()
     } else if protein2genome {
-        "protein2genome".to_owned()
+        "protein2genome:local".to_owned()
     } else if matches!(model_name.as_str(), "protein2dna" | "p2d") {
         "protein2dna".to_owned()
     } else if matches!(model_name.as_str(), "protein2dna:bestfit" | "p2d:b") {

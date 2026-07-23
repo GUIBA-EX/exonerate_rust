@@ -4,6 +4,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 
+mod low_memory;
+pub use low_memory::{
+    align_database_with_dp_memory, align_low_memory, align_protein_database_with_dp_memory,
+    align_protein_low_memory, align_protein_with_dp_memory, align_with_dp_memory,
+};
+
 /// Generic model graph, independent from a particular DP memory layout.
 pub mod model {
     use super::Score;
@@ -1317,9 +1323,17 @@ impl Alignment {
         let mut current: Option<(char, u64, u64)> = None;
         for run in &self.trace {
             let (query, target) = (run.query_advance as u64, run.target_advance as u64);
-            let item = (run.op.vulgar(), query * run.repeats, target * run.repeats);
+            let label = if run.op == Op::Match && run.query_advance == 3 && run.target_advance == 3
+            {
+                'C'
+            } else {
+                run.op.vulgar()
+            };
+            let item = (label, query * run.repeats, target * run.repeats);
             match current {
-                Some((last, q, t)) if last == item.0 => {
+                Some((last, q, t))
+                    if last == item.0 && (q > 0 || item.1 == 0) && (t > 0 || item.2 == 0) =>
+                {
                     current = Some((last, q + item.1, t + item.2))
                 }
                 Some((last, q, t)) => {
@@ -2177,6 +2191,18 @@ pub fn align_model_ir_with_intron(
     intron: IntronScoring,
     strand: Strand,
 ) -> Result<Alignment, ExecutionError> {
+    align_model_ir_with_intron_forbidden(query, target, ir, scoring, intron, strand, None)
+}
+
+fn align_model_ir_with_intron_forbidden(
+    query: &Sequence,
+    target: &Sequence,
+    ir: &model::ModelIr,
+    scoring: Scoring,
+    intron: IntronScoring,
+    strand: Strand,
+    forbidden: Option<&HashSet<(usize, usize)>>,
+) -> Result<Alignment, ExecutionError> {
     ir.validate().map_err(ExecutionError::InvalidModel)?;
     if ir.transitions.len() > u16::MAX as usize {
         return Err(ExecutionError::TooManyTransitions(ir.transitions.len()));
@@ -2690,6 +2716,15 @@ pub fn align_model_ir_with_intron(
                     let ni = i + edge.query_advance as usize;
                     let nj = j + edge.target_advance as usize;
                     if ni > n || nj > m {
+                        continue;
+                    }
+                    let scores_pair = edge.label == model::Label::Match
+                        || (edge.label == model::Label::SplitCodon
+                            && matches!(
+                                edge.kernel,
+                                model::ScoreKernel::Phase | model::ScoreKernel::CodonSubstitution
+                            ));
+                    if scores_pair && forbidden.is_some_and(|pairs| pairs.contains(&(i, j))) {
                         continue;
                     }
                     let is_partial_codon = matches!(edge.kernel, model::ScoreKernel::Phase)
@@ -3291,12 +3326,13 @@ pub fn align_est2genome_stranded(
     intron: IntronScoring,
     both_strands: bool,
 ) -> Alignment {
-    let forward = align_est2genome_one(query, target, &target.bases, intron, Strand::Forward);
+    let forward = align_est2genome_one(query, target, &target.bases, intron, Strand::Forward, None);
     if !both_strands {
         return forward;
     }
     let reverse_bases = reverse_complement(&target.bases);
-    let reverse = align_est2genome_one(query, target, &reverse_bases, intron, Strand::Reverse);
+    let reverse =
+        align_est2genome_one(query, target, &reverse_bases, intron, Strand::Reverse, None);
     if reverse.score > forward.score {
         reverse
     } else {
@@ -3310,6 +3346,7 @@ fn align_est2genome_one(
     bases: &[u8],
     intron: IntronScoring,
     strand: Strand,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
     let (n, m, cols) = (query.bases.len(), bases.len(), bases.len() + 1);
     let size = (n + 1) * (m + 1);
@@ -3420,7 +3457,7 @@ fn align_est2genome_one(
                     }
                 }
             }
-            if i > 0 && j > 0 {
+            if i > 0 && j > 0 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 1))) {
                 let p = idx(i - 1, j - 1, cols);
                 let (previous, previous_state) =
                     best(&[(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]);
@@ -3604,9 +3641,180 @@ fn align_est2genome_one(
     }
 }
 
+/// Pair-disjoint suboptimal EST-to-genome alignments. Each target orientation
+/// owns an independent forbidden-cell set, matching upstream strand semantics.
+pub fn align_est2genome_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        align_est2genome_one(
+            query,
+            target,
+            &target.bases,
+            intron,
+            Strand::Forward,
+            Some(forbidden),
+        )
+    });
+    if both_strands {
+        let reverse_bases = reverse_complement(&target.bases);
+        out.extend(enumerate_suboptimal_pair(
+            query,
+            target,
+            threshold,
+            |forbidden| {
+                align_est2genome_one(
+                    query,
+                    target,
+                    &reverse_bases,
+                    intron,
+                    Strand::Reverse,
+                    Some(forbidden),
+                )
+            },
+        ));
+    }
+    out
+}
+
+pub fn align_est2genome_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_est2genome_suboptimal(
+                query,
+                target,
+                intron,
+                threshold,
+                both_strands,
+            ));
+        }
+    }
+    out
+}
+
 /// Score-only compatibility wrapper for callers that do not need a traceback.
 pub fn est2genome_score(query: &Sequence, target: &Sequence, intron: IntronScoring) -> Score {
     align_est2genome(query, target, intron).score
+}
+
+fn align_model_ir_suboptimal_pair(
+    query: &Sequence,
+    target: &Sequence,
+    ir: &model::ModelIr,
+    scoring: Scoring,
+    intron: IntronScoring,
+    strand: Strand,
+    threshold: Score,
+) -> Vec<Alignment> {
+    enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        align_model_ir_with_intron_forbidden(
+            query,
+            target,
+            ir,
+            scoring,
+            intron,
+            strand,
+            Some(forbidden),
+        )
+        .expect("validated built-in model must execute")
+    })
+}
+
+pub fn align_ungapped_translated_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let ir = model::ungapped_translated(model::Scope::Anywhere);
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_model_ir_suboptimal_pair(
+                query,
+                target,
+                &ir,
+                scoring,
+                IntronScoring::default(),
+                Strand::Forward,
+                threshold,
+            ));
+            if both_strands {
+                let reverse_query = Sequence {
+                    id: query.id.clone(),
+                    bases: reverse_complement(&query.bases),
+                };
+                let mut reverse = align_model_ir_suboptimal_pair(
+                    &reverse_query,
+                    target,
+                    &ir,
+                    scoring,
+                    IntronScoring::default(),
+                    Strand::Forward,
+                    threshold,
+                );
+                for alignment in &mut reverse {
+                    alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+                    alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                    alignment.query_strand = Strand::Reverse;
+                }
+                out.extend(reverse);
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn align_ner_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    min_len: u32,
+    max_len: u32,
+    open: Score,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let ir = model::ner(min_len, max_len, open);
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_model_ir_suboptimal_pair(
+                query,
+                target,
+                &ir,
+                scoring,
+                IntronScoring::default(),
+                Strand::Forward,
+                threshold,
+            ));
+            if both_strands {
+                out.extend(align_model_ir_suboptimal_pair(
+                    query,
+                    target,
+                    &ir,
+                    scoring,
+                    IntronScoring::default(),
+                    Strand::Reverse,
+                    threshold,
+                ));
+            }
+        }
+    }
+    out
 }
 
 pub fn align_ungapped_translated_database(
@@ -3949,6 +4157,7 @@ fn align_protein_to_genome_heuristic_oriented(
             intron,
             strand,
             bestfit,
+            None,
         );
     };
     let (target_start, target_end) = if strand == Strand::Reverse {
@@ -3976,6 +4185,7 @@ fn align_protein_to_genome_heuristic_oriented(
         intron,
         strand,
         bestfit,
+        None,
     );
     remap_target_slice(&mut alignment, target_start, target.bases.len());
     alignment
@@ -4271,7 +4481,9 @@ fn forbid_alignment_pairs(
     let before = forbidden.len();
     for run in &alignment.trace {
         for _ in 0..run.repeats {
-            if run.op == Op::Match && run.query_advance == 1 && run.target_advance == 1 {
+            if run.op == Op::Match
+                || (run.op == Op::SplitCodon && run.query_advance > 0 && run.target_advance > 0)
+            {
                 forbidden.insert((query_position, target_position));
             }
             query_position += run.query_advance as usize;
@@ -4362,7 +4574,12 @@ pub fn align_protein_database(
 }
 
 /// Exhaustive local coding-DNA alignment with codon-affine gaps and frameshifts.
-pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring) -> Alignment {
+fn align_coding2coding_forbidden(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    forbidden: Option<&HashSet<(usize, usize)>>,
+) -> Alignment {
     let (n, m, cols) = (
         query.bases.len(),
         target.bases.len(),
@@ -4465,7 +4682,7 @@ pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring
                     }
                 }
             }
-            if i >= 3 && j >= 3 {
+            if i >= 3 && j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
                 let p = idx(i - 3, j - 3, cols);
                 let (value, state) =
                     best(&[(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]);
@@ -4491,8 +4708,10 @@ pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring
         }
     }
     let (mut i, mut j, mut state, score) = end;
+    let final_state = state;
     let (query_end, target_end) = (i as u64, j as u64);
     let mut trace = Vec::new();
+    let mut reversed_raw_fragments: Vec<Vec<RawStep>> = Vec::new();
     while state != State::Stop {
         let parent = match state {
             State::M => pm[idx(i, j, cols)],
@@ -4501,6 +4720,87 @@ pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring
             State::Stop => None,
         };
         let Some(parent) = parent else { break };
+        let mut raw_fragment = Vec::new();
+        if state == State::M {
+            let epsilon = match parent.state {
+                State::I => Some(4),
+                State::D => Some(7),
+                _ => None,
+            };
+            if let Some(transition_id) = epsilon {
+                raw_fragment.push(RawStep {
+                    transition_id,
+                    query_advance: 0,
+                    target_advance: 0,
+                    score: 0,
+                });
+            }
+        }
+        match parent.op {
+            Op::Match => raw_fragment.push(RawStep {
+                transition_id: 1,
+                query_advance: 3,
+                target_advance: 3,
+                score: protein_score(
+                    translate_dna(&query.bases[i - 3..i], 0)[0],
+                    translate_dna(&target.bases[j - 3..j], 0)[0],
+                    scoring,
+                ),
+            }),
+            Op::Insert => raw_fragment.push(RawStep {
+                transition_id: if parent.transition_id == 2 { 2 } else { 3 },
+                query_advance: 3,
+                target_advance: 0,
+                score: if parent.transition_id == 2 {
+                    scoring.codon_gap_open
+                } else {
+                    scoring.codon_gap_extend
+                },
+            }),
+            Op::Delete => raw_fragment.push(RawStep {
+                transition_id: if parent.transition_id == 3 { 5 } else { 6 },
+                query_advance: 0,
+                target_advance: 3,
+                score: if parent.transition_id == 3 {
+                    scoring.codon_gap_open
+                } else {
+                    scoring.codon_gap_extend
+                },
+            }),
+            Op::Frameshift => {
+                if parent.query_advance > 0 {
+                    let short = parent.query_advance % 3;
+                    raw_fragment.push(RawStep {
+                        transition_id: if short == 1 { 8 } else { 9 },
+                        query_advance: short,
+                        target_advance: 0,
+                        score: scoring.frameshift,
+                    });
+                    raw_fragment.push(RawStep {
+                        transition_id: if parent.query_advance > 3 { 11 } else { 10 },
+                        query_advance: if parent.query_advance > 3 { 3 } else { 0 },
+                        target_advance: 0,
+                        score: 0,
+                    });
+                } else {
+                    let short = parent.target_advance % 3;
+                    raw_fragment.push(RawStep {
+                        transition_id: if short == 1 { 12 } else { 13 },
+                        query_advance: 0,
+                        target_advance: short,
+                        score: scoring.frameshift,
+                    });
+                    raw_fragment.push(RawStep {
+                        transition_id: if parent.target_advance > 3 { 15 } else { 14 },
+                        query_advance: 0,
+                        target_advance: if parent.target_advance > 3 { 3 } else { 0 },
+                        score: 0,
+                    });
+                }
+            }
+            _ => unreachable!("coding2coding specialized traceback operation"),
+        }
+        reversed_raw_fragments.push(raw_fragment);
         i -= parent.query_advance as usize;
         j -= parent.target_advance as usize;
         trace.push(TraceRun {
@@ -4513,6 +4813,38 @@ pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring
         state = parent.state;
     }
     trace.reverse();
+    reversed_raw_fragments.reverse();
+    let mut raw_trace = vec![RawStep {
+        transition_id: 0,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    }];
+    for fragment in reversed_raw_fragments {
+        raw_trace.extend(fragment);
+    }
+    if final_state == State::I {
+        raw_trace.push(RawStep {
+            transition_id: 4,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    if final_state == State::D {
+        raw_trace.push(RawStep {
+            transition_id: 7,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: 16,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
     let mut canonical = Vec::new();
     for run in trace {
         TraceFragment::one(run).append_to(&mut canonical);
@@ -4528,9 +4860,73 @@ pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring
         target_len: target.bases.len() as u64,
         target_strand: Strand::Forward,
         score,
-        raw_trace: Vec::new(),
+        raw_trace,
         trace: canonical,
     }
+}
+
+/// Exhaustive local coding-DNA alignment with codon-affine gaps and frameshifts.
+pub fn align_coding2coding(query: &Sequence, target: &Sequence, scoring: Scoring) -> Alignment {
+    align_coding2coding_forbidden(query, target, scoring, None)
+}
+
+fn enumerate_suboptimal_pair<F>(
+    query: &Sequence,
+    target: &Sequence,
+    threshold: Score,
+    mut aligner: F,
+) -> Vec<Alignment>
+where
+    F: FnMut(&HashSet<(usize, usize)>) -> Alignment,
+{
+    let mut forbidden = HashSet::new();
+    let mut out = Vec::new();
+    loop {
+        let alignment = aligner(&forbidden);
+        if alignment.score < threshold || alignment.score <= 0 {
+            break;
+        }
+        let added = forbid_alignment_pairs(
+            &alignment,
+            query.bases.len(),
+            target.bases.len(),
+            &mut forbidden,
+        );
+        out.push(alignment);
+        if added == 0 {
+            break;
+        }
+    }
+    out
+}
+
+/// Waterman-Eggert-style pair-disjoint suboptimal coding alignments.
+pub fn align_coding2coding_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        align_coding2coding_forbidden(query, target, scoring, Some(forbidden))
+    })
+}
+
+pub fn align_coding2coding_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_coding2coding_suboptimal(
+                query, target, scoring, threshold,
+            ));
+        }
+    }
+    out
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4626,6 +5022,7 @@ fn cdna2genome_dp(
     target: &Sequence,
     scoring: Scoring,
     intron: IntronScoring,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> CdnaDp {
     let (n, m, cols) = (
         query.bases.len(),
@@ -4731,7 +5128,7 @@ fn cdna2genome_dp(
                     );
                 }
             }
-            if i > 0 && j > 0 {
+            if i > 0 && j > 0 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 1))) {
                 let p = idx(i - 1, j - 1, cols);
                 let (v, st) = best(&[(u5m[p], State::M), (u5i[p], State::I), (u5d[p], State::D)]);
                 cdna_relax(
@@ -4854,6 +5251,12 @@ fn cdna2genome_dp(
                                 ),
                             ) {
                                 let pre = c.start - phase;
+                                if forbidden.is_some_and(|pairs| {
+                                    pairs.contains(&(i - 3, pre))
+                                        || pairs.contains(&(i - post, post_start))
+                                }) {
+                                    continue;
+                                }
                                 let mut codon = Vec::with_capacity(3);
                                 codon.extend_from_slice(&target.bases[pre..c.start]);
                                 codon.extend_from_slice(&target.bases[post_start..j]);
@@ -4992,7 +5395,7 @@ fn cdna2genome_dp(
                         repeats: 1,
                     }),
                 );
-                if j >= 3 {
+                if j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
                     let p = idx(i - 3, j - 3, cols);
                     let (v, st) = best(&[(cm[p], State::M), (ci[p], State::I), (cd[p], State::D)]);
                     cdna_relax(
@@ -5068,21 +5471,6 @@ fn cdna2genome_dp(
                     );
                 }
             }
-            // epsilon transition: coding into the 3-prime UTR match state.
-            let (candidate, state) =
-                best(&[(cm[k], State::M), (ci[k], State::I), (cd[k], State::D)]);
-            cdna_relax(
-                &mut u3m[k],
-                &mut pu3m[k],
-                candidate,
-                match state {
-                    State::M => CdnaState::CodingM,
-                    State::I => CdnaState::CodingI,
-                    State::D => CdnaState::CodingD,
-                    State::Stop => unreachable!(),
-                },
-                TraceFragment::empty(),
-            );
             if j >= intron.min_len as usize {
                 let s = j - intron.min_len as usize;
                 let p = idx(i, s, cols);
@@ -5151,7 +5539,7 @@ fn cdna2genome_dp(
                     );
                 }
             }
-            if i > 0 && j > 0 {
+            if i > 0 && j > 0 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 1))) {
                 let p = idx(i - 1, j - 1, cols);
                 let (v, st) = best(&[(u3m[p], State::M), (u3i[p], State::I), (u3d[p], State::D)]);
                 cdna_relax(
@@ -5220,13 +5608,28 @@ fn cdna2genome_dp(
                     }),
                 );
             }
+            // epsilon transition: coding into the 3-prime UTR match state.
+            let (candidate, state) =
+                best(&[(cm[k], State::M), (ci[k], State::I), (cd[k], State::D)]);
+            cdna_relax(
+                &mut u3m[k],
+                &mut pu3m[k],
+                candidate,
+                match state {
+                    State::M => CdnaState::CodingM,
+                    State::I => CdnaState::CodingI,
+                    State::D => CdnaState::CodingD,
+                    State::Stop => unreachable!(),
+                },
+                TraceFragment::empty(),
+            );
             for (value, state) in [
-                (cm[k], CdnaState::CodingM),
-                (ci[k], CdnaState::CodingI),
-                (cd[k], CdnaState::CodingD),
                 (u3m[k], CdnaState::U3M),
                 (u3i[k], CdnaState::U3I),
                 (u3d[k], CdnaState::U3D),
+                (cm[k], CdnaState::CodingM),
+                (ci[k], CdnaState::CodingI),
+                (cd[k], CdnaState::CodingD),
             ] {
                 if (value, i, j) > (end.3, end.0, end.1) {
                     end = (i, j, state, value);
@@ -5265,34 +5668,267 @@ pub fn cdna2genome_score(
     scoring: Scoring,
     intron: IntronScoring,
 ) -> Score {
-    let dp = cdna2genome_dp(query, target, scoring, intron);
+    let dp = cdna2genome_dp(query, target, scoring, intron, None);
     dp.value(dp.end.2, idx(dp.end.0, dp.end.1, dp.cols))
 }
 
-/// Full cDNA-to-genome traceback over the composed UTR/CDS/UTR DP lattice.
-pub fn align_cdna_to_genome(
+fn cdna_coding_state(state: CdnaState) -> Option<State> {
+    match state {
+        CdnaState::CodingM => Some(State::M),
+        CdnaState::CodingI => Some(State::I),
+        CdnaState::CodingD => Some(State::D),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cdna_raw_fragment(
+    parent: CdnaParent,
+    destination: CdnaState,
+    query_end: usize,
+    target_end: usize,
     query: &Sequence,
     target: &Sequence,
     scoring: Scoring,
     intron: IntronScoring,
+) -> Vec<RawStep> {
+    if parent.fragment.atoms.iter().all(Option::is_none) {
+        let transition_id = match (parent.state, destination) {
+            (CdnaState::U5M, CdnaState::CodingM) => 320,
+            (CdnaState::CodingM, CdnaState::U3M) => 321,
+            _ => 322,
+        };
+        return if transition_id == 321 {
+            vec![
+                RawStep {
+                    transition_id,
+                    query_advance: 0,
+                    target_advance: 0,
+                    score: 0,
+                },
+                RawStep {
+                    transition_id: 400,
+                    query_advance: 0,
+                    target_advance: 0,
+                    score: 0,
+                },
+            ]
+        } else {
+            vec![RawStep {
+                transition_id,
+                query_advance: 0,
+                target_advance: 0,
+                score: 0,
+            }]
+        };
+    }
+    if let (Some(source), Some(destination)) = (
+        cdna_coding_state(parent.state),
+        cdna_coding_state(destination),
+    ) {
+        return coding2genome_raw_fragment(
+            P2GenomeParent {
+                state: source,
+                fragment: parent.fragment,
+            },
+            destination,
+            query_end,
+            target_end,
+            query,
+            &target.bases,
+            scoring,
+            intron,
+        );
+    }
+    let (query_advance, target_advance) = parent.fragment.advances();
+    let query_start = query_end - query_advance;
+    let target_start = target_end - target_advance;
+    let is_u5 = matches!(
+        destination,
+        CdnaState::U5M | CdnaState::U5I | CdnaState::U5D
+    );
+    let base = if is_u5 { 300 } else { 400 };
+    let mut raw = Vec::new();
+    if matches!(destination, CdnaState::U5M | CdnaState::U3M) {
+        let epsilon = match parent.state {
+            CdnaState::U5I | CdnaState::U3I => Some(base + 4),
+            CdnaState::U5D | CdnaState::U3D => Some(base + 7),
+            _ => None,
+        };
+        if let Some(transition_id) = epsilon {
+            raw.push(RawStep {
+                transition_id,
+                query_advance: 0,
+                target_advance: 0,
+                score: 0,
+            });
+        }
+    }
+    let atoms = parent
+        .fragment
+        .atoms
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if atoms.iter().any(|run| run.op == Op::Intron) {
+        raw.push(RawStep {
+            transition_id: base + 10,
+            query_advance: 0,
+            target_advance: 2,
+            score: intron.open_penalty.saturating_add(
+                splice_score(
+                    &target.bases,
+                    target_start,
+                    SpliceType::DonorForward,
+                    intron.force_gtag,
+                )
+                .unwrap_or(0),
+            ),
+        });
+        for _ in 0..(target_advance - 4) {
+            raw.push(RawStep {
+                transition_id: base + 11,
+                query_advance: 0,
+                target_advance: 1,
+                score: 0,
+            });
+        }
+        raw.push(RawStep {
+            transition_id: base + 12,
+            query_advance: 0,
+            target_advance: 2,
+            score: splice_score(
+                &target.bases,
+                target_end - 2,
+                SpliceType::AcceptorForward,
+                intron.force_gtag,
+            )
+            .unwrap_or(0),
+        });
+        return raw;
+    }
+    let run = atoms[0];
+    match run.op {
+        Op::Match => raw.push(RawStep {
+            transition_id: base + 1,
+            query_advance: 1,
+            target_advance: 1,
+            score: dna_score(
+                query.bases[query_start],
+                target.bases[target_start],
+                scoring,
+            ),
+        }),
+        Op::Insert => raw.push(RawStep {
+            transition_id: if run.transition_id == 2 {
+                base + 2
+            } else {
+                base + 3
+            },
+            query_advance: 1,
+            target_advance: 0,
+            score: if run.transition_id == 2 {
+                scoring.gap_open
+            } else {
+                scoring.gap_extend
+            },
+        }),
+        Op::Delete => raw.push(RawStep {
+            transition_id: if run.transition_id == 3 {
+                base + 5
+            } else {
+                base + 6
+            },
+            query_advance: 0,
+            target_advance: 1,
+            score: if run.transition_id == 3 {
+                scoring.gap_open
+            } else {
+                scoring.gap_extend
+            },
+        }),
+        _ => unreachable!("cDNA UTR parent fragment"),
+    }
+    raw
+}
+
+/// Full cDNA-to-genome traceback over the composed UTR/CDS/UTR DP lattice.
+fn align_cdna_to_genome_forbidden(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
-    let dp = cdna2genome_dp(query, target, scoring, intron);
+    let dp = cdna2genome_dp(query, target, scoring, intron, forbidden);
     let (mut i, mut j, mut state, score) = dp.end;
+    let final_state = state;
     let (query_end, target_end) = (i as u64, j as u64);
     let mut fragments = Vec::new();
     while let Some(parent) = dp.parent(state, idx(i, j, dp.cols)) {
+        let raw_fragment = cdna_raw_fragment(parent, state, i, j, query, target, scoring, intron);
         let (query_advance, target_advance) = parent.fragment.advances();
         debug_assert!(i >= query_advance && j >= target_advance);
         i -= query_advance;
         j -= target_advance;
-        fragments.push(parent.fragment);
+        fragments.push((parent.fragment, raw_fragment));
         state = parent.state;
     }
     fragments.reverse();
     let mut trace = Vec::new();
-    for fragment in fragments {
-        fragment.append_to(&mut trace);
+    let mut raw_trace = vec![RawStep {
+        transition_id: 300,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    }];
+    for (fragment, raw_fragment) in fragments {
+        for atom in fragment.atoms.into_iter().flatten() {
+            if atom.op == Op::Intron && atom.query_advance > 0 && atom.target_advance > 0 {
+                TraceFragment::one(TraceRun {
+                    query_advance: 0,
+                    ..atom
+                })
+                .append_to(&mut trace);
+                TraceFragment::one(TraceRun {
+                    target_advance: 0,
+                    ..atom
+                })
+                .append_to(&mut trace);
+            } else {
+                TraceFragment::one(atom).append_to(&mut trace);
+            }
+        }
+        raw_trace.extend(raw_fragment);
     }
+    let terminal = match final_state {
+        CdnaState::U5I => Some(304),
+        CdnaState::U5D => Some(307),
+        CdnaState::CodingI => Some(4),
+        CdnaState::CodingD => Some(7),
+        CdnaState::U3I => Some(404),
+        CdnaState::U3D => Some(407),
+        _ => None,
+    };
+    if let Some(transition_id) = terminal {
+        raw_trace.push(RawStep {
+            transition_id,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    let end_id = match final_state {
+        CdnaState::U5M | CdnaState::U5I | CdnaState::U5D => 308,
+        CdnaState::CodingM | CdnaState::CodingI | CdnaState::CodingD => 16,
+        CdnaState::U3M | CdnaState::U3I | CdnaState::U3D => 408,
+    };
+    raw_trace.push(RawStep {
+        transition_id: end_id,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
     Alignment {
         query_id: query.id.clone(),
         target_id: target.id.clone(),
@@ -5304,9 +5940,48 @@ pub fn align_cdna_to_genome(
         target_len: target.bases.len() as u64,
         target_strand: Strand::Forward,
         score,
-        raw_trace: Vec::new(),
+        raw_trace,
         trace,
     }
+}
+
+pub fn align_cdna_to_genome(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+) -> Alignment {
+    align_cdna_to_genome_forbidden(query, target, scoring, intron, None)
+}
+
+pub fn align_cdna_to_genome_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        align_cdna_to_genome_forbidden(query, target, scoring, intron, Some(forbidden))
+    })
+}
+
+pub fn align_cdna_to_genome_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_cdna_to_genome_suboptimal(
+                query, target, scoring, intron, threshold,
+            ));
+        }
+    }
+    out
 }
 
 pub fn align_cdna_to_genome_database(
@@ -5403,16 +6078,299 @@ fn genome_relax<S: Into<GenomeState>>(
     }
 }
 
+fn genome_state_is_coding(state: GenomeState) -> bool {
+    matches!(
+        state,
+        GenomeState::CdsM | GenomeState::CdsI | GenomeState::CdsD
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn genome_raw_fragment(
+    parent: GenomeParent,
+    destination: GenomeState,
+    query_end: usize,
+    target_end: usize,
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+) -> Vec<RawStep> {
+    let (query_advance, target_advance) = parent.fragment.advances();
+    let query_start = query_end - query_advance;
+    let target_start = target_end - target_advance;
+    let atoms = parent
+        .fragment
+        .atoms
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if atoms.is_empty() {
+        return vec![RawStep {
+            transition_id: if genome_state_is_coding(destination) {
+                50
+            } else {
+                58
+            },
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        }];
+    }
+
+    let first_id = atoms
+        .iter()
+        .map(|run| run.transition_id)
+        .find(|id| matches!(id, 40 | 43 | 46 | 60 | 65 | 70))
+        .unwrap_or(atoms[0].transition_id);
+    if atoms.iter().any(|run| run.op == Op::Intron) {
+        let phase = atoms
+            .iter()
+            .find(|run| run.op == Op::SplitCodon)
+            .map_or(0, |run| run.query_advance as usize);
+        let coding = first_id >= 60;
+        let post = if coding { 3 - phase } else { 0 };
+        let on_query = matches!(first_id, 43 | 46 | 65 | 70);
+        let on_target = matches!(first_id, 40 | 46 | 60 | 70);
+        let query_donor = query_start + phase;
+        let target_donor = target_start + phase;
+        let query_post = query_end - post;
+        let target_post = target_end - post;
+        let (pre_id, query_loop_id, target_loop_id, post_id, pre_split_id, post_split_id) =
+            match first_id {
+                40 => (40, 0, 41, 42, 0, 0),
+                43 => (43, 44, 0, 45, 0, 0),
+                46 => (46, 47, 49, 48, 0, 0),
+                60 => (
+                    110 + phase as u16,
+                    0,
+                    120 + phase as u16,
+                    130 + phase as u16,
+                    100 + phase as u16,
+                    140 + phase as u16,
+                ),
+                65 => (
+                    160 + phase as u16,
+                    170 + phase as u16,
+                    0,
+                    180 + phase as u16,
+                    150 + phase as u16,
+                    190 + phase as u16,
+                ),
+                70 => (
+                    210 + phase as u16,
+                    220 + phase as u16,
+                    230 + phase as u16,
+                    240 + phase as u16,
+                    200 + phase as u16,
+                    250 + phase as u16,
+                ),
+                _ => unreachable!("genome intron fragment"),
+            };
+        let mut raw = Vec::new();
+        if coding && phase > 0 {
+            raw.push(RawStep {
+                transition_id: pre_split_id,
+                query_advance: phase as u32,
+                target_advance: phase as u32,
+                score: 0,
+            });
+        }
+        let donor_score = intron
+            .open_penalty
+            .saturating_add(if on_query {
+                splice_score(
+                    &query.bases,
+                    query_donor,
+                    SpliceType::DonorForward,
+                    intron.force_gtag,
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            })
+            .saturating_add(if on_target {
+                splice_score(
+                    &target.bases,
+                    target_donor,
+                    SpliceType::DonorForward,
+                    intron.force_gtag,
+                )
+                .unwrap_or(0)
+            } else {
+                0
+            });
+        raw.push(RawStep {
+            transition_id: pre_id,
+            query_advance: if on_query { 2 } else { 0 },
+            target_advance: if on_target { 2 } else { 0 },
+            score: donor_score,
+        });
+        if on_target {
+            for _ in 0..target_post.saturating_sub(target_donor + 4) {
+                raw.push(RawStep {
+                    transition_id: target_loop_id,
+                    query_advance: 0,
+                    target_advance: 1,
+                    score: 0,
+                });
+            }
+        }
+        if on_query {
+            for _ in 0..query_post.saturating_sub(query_donor + 4) {
+                raw.push(RawStep {
+                    transition_id: query_loop_id,
+                    query_advance: 1,
+                    target_advance: 0,
+                    score: 0,
+                });
+            }
+        }
+
+        let acceptor_score = (if on_query {
+            splice_score(
+                &query.bases,
+                query_post - 2,
+                SpliceType::AcceptorForward,
+                intron.force_gtag,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        })
+        .saturating_add(if on_target {
+            splice_score(
+                &target.bases,
+                target_post - 2,
+                SpliceType::AcceptorForward,
+                intron.force_gtag,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        });
+        raw.push(RawStep {
+            transition_id: post_id,
+            query_advance: if on_query { 2 } else { 0 },
+            target_advance: if on_target { 2 } else { 0 },
+            score: acceptor_score,
+        });
+        if coding {
+            let mut query_codon = Vec::with_capacity(3);
+            query_codon.extend_from_slice(&query.bases[query_start..query_donor]);
+            query_codon.extend_from_slice(&query.bases[query_post..query_end]);
+            let mut target_codon = Vec::with_capacity(3);
+            target_codon.extend_from_slice(&target.bases[target_start..target_donor]);
+            target_codon.extend_from_slice(&target.bases[target_post..target_end]);
+            raw.push(RawStep {
+                transition_id: post_split_id,
+                query_advance: post as u32,
+                target_advance: post as u32,
+                score: protein_score(
+                    translate_dna(&query_codon, 0)[0],
+                    translate_dna(&target_codon, 0)[0],
+                    scoring,
+                ),
+            });
+        }
+        return raw;
+    }
+
+    let run = atoms[0];
+    let mut raw = Vec::new();
+    if matches!(destination, GenomeState::UtrM | GenomeState::CdsM) {
+        let close_id = match parent.state {
+            GenomeState::UtrI => Some(35),
+            GenomeState::UtrD => Some(36),
+            GenomeState::CdsI => Some(59),
+            GenomeState::CdsD => Some(79),
+            _ => None,
+        };
+        if let Some(transition_id) = close_id {
+            raw.push(RawStep {
+                transition_id,
+                query_advance: 0,
+                target_advance: 0,
+                score: 0,
+            });
+        }
+    }
+    match run.op {
+        Op::Match if run.query_advance == 1 => raw.push(RawStep {
+            transition_id: 30,
+            query_advance: 1,
+            target_advance: 1,
+            score: dna_score(
+                query.bases[query_start],
+                target.bases[target_start],
+                scoring,
+            ),
+        }),
+        Op::Match => raw.push(RawStep {
+            transition_id: 51,
+            query_advance: 3,
+            target_advance: 3,
+            score: protein_score(
+                translate_dna(&query.bases[query_start..query_end], 0)[0],
+                translate_dna(&target.bases[target_start..target_end], 0)[0],
+                scoring,
+            ),
+        }),
+        Op::Insert | Op::Delete => raw.push(RawStep {
+            transition_id: run.transition_id,
+            query_advance: run.query_advance,
+            target_advance: run.target_advance,
+            score: match run.transition_id {
+                31 | 33 => scoring.gap_open,
+                32 | 34 => scoring.gap_extend,
+                52 | 53 => scoring.codon_gap_open,
+                54 | 55 => scoring.codon_gap_extend,
+                _ => unreachable!("genome gap transition"),
+            },
+        }),
+        Op::Frameshift => {
+            let advance = run.query_advance.max(run.target_advance);
+            let short = advance % 3;
+            let on_query = run.query_advance > 0;
+            raw.push(RawStep {
+                transition_id: match (on_query, short) {
+                    (true, 1) => 80,
+                    (true, _) => 81,
+                    (false, 1) => 84,
+                    (false, _) => 85,
+                },
+                query_advance: if on_query { short } else { 0 },
+                target_advance: if on_query { 0 } else { short },
+                score: scoring.frameshift,
+            });
+            raw.push(RawStep {
+                transition_id: match (on_query, advance > 3) {
+                    (true, false) => 82,
+                    (true, true) => 83,
+                    (false, false) => 86,
+                    (false, true) => 87,
+                },
+                query_advance: if on_query && advance > 3 { 3 } else { 0 },
+                target_advance: if !on_query && advance > 3 { 3 } else { 0 },
+                score: 0,
+            });
+        }
+        _ => unreachable!("genome parent fragment"),
+    }
+    raw
+}
+
 #[allow(clippy::needless_range_loop)]
 /// Local genome-to-genome Viterbi with affine DNA gaps plus query-only,
 /// target-only, and synchronised (joint) introns.  A joint intron has one
 /// opening penalty and splice scores on both sequences, exactly as upstream
 /// `Intron_create("joint", TRUE, TRUE, TRUE)` specifies.
-pub fn align_genome_to_genome(
+fn align_genome_to_genome_forbidden(
     query: &Sequence,
     target: &Sequence,
     scoring: Scoring,
     intron: IntronScoring,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
     let (n, m, cols) = (
         query.bases.len(),
@@ -5735,7 +6693,7 @@ pub fn align_genome_to_genome(
                     );
                 }
             }
-            if i > 0 && j > 0 {
+            if i > 0 && j > 0 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 1))) {
                 let source = idx(i - 1, j - 1, cols);
                 let (value, state) = best(&[
                     (mat[source], State::M),
@@ -5851,6 +6809,12 @@ pub fn align_genome_to_genome(
                             intron.force_gtag,
                         ),
                     ) {
+                        if forbidden.is_some_and(|pairs| {
+                            pairs.contains(&(candidate.start - phase, j - 3))
+                                || pairs.contains(&(post_start, j - post))
+                        }) {
+                            continue;
+                        }
                         let mut query_codon = Vec::with_capacity(3);
                         query_codon.extend_from_slice(
                             &query.bases[candidate.start - phase..candidate.start],
@@ -5969,6 +6933,14 @@ pub fn align_genome_to_genome(
                             intron.force_gtag,
                         ),
                     ) {
+                        if forbidden.is_some_and(|pairs| {
+                            pairs.contains(&(
+                                candidate.query_start - phase,
+                                candidate.target_start - phase,
+                            )) || pairs.contains(&(query_post, target_post))
+                        }) {
+                            continue;
+                        }
                         let mut query_codon = Vec::with_capacity(3);
                         query_codon.extend_from_slice(
                             &query.bases[candidate.query_start - phase..candidate.query_start],
@@ -6387,7 +7359,7 @@ pub fn align_genome_to_genome(
                     }),
                 );
             }
-            if i >= 3 && j >= 3 {
+            if i >= 3 && j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
                 let p = idx(i - 3, j - 3, cols);
                 let (candidate, state) =
                     best(&[(cm[p], State::M), (ci[p], State::I), (cd[p], State::D)]);
@@ -6491,6 +7463,7 @@ pub fn align_genome_to_genome(
         }
     }
     let (mut i, mut j, mut state, score) = end;
+    let final_state = state;
     let (query_end, target_end) = (i as u64, j as u64);
     let mut fragments = Vec::new();
     loop {
@@ -6503,18 +7476,72 @@ pub fn align_genome_to_genome(
             GenomeState::CdsD => pcd[idx(i, j, cols)],
         };
         let Some(parent) = parent else { break };
+        let raw_fragment = genome_raw_fragment(parent, state, i, j, query, target, scoring, intron);
         let (qa, ta) = parent.fragment.advances();
         debug_assert!(i >= qa && j >= ta);
         i -= qa;
         j -= ta;
-        fragments.push(parent.fragment);
+        fragments.push((parent.fragment, raw_fragment));
         state = parent.state;
     }
     fragments.reverse();
     let mut trace = Vec::new();
-    for fragment in fragments {
-        fragment.append_to(&mut trace);
+    let mut raw_trace = vec![RawStep {
+        transition_id: 29,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    }];
+    for (fragment, raw_fragment) in fragments {
+        for atom in fragment.atoms.into_iter().flatten() {
+            if atom.op == Op::Intron && atom.query_advance > 0 && atom.target_advance > 0 {
+                TraceFragment::one(TraceRun {
+                    query_advance: 0,
+                    ..atom
+                })
+                .append_to(&mut trace);
+                TraceFragment::one(TraceRun {
+                    target_advance: 0,
+                    ..atom
+                })
+                .append_to(&mut trace);
+            } else {
+                TraceFragment::one(atom).append_to(&mut trace);
+            }
+        }
+        raw_trace.extend(raw_fragment);
     }
+    let terminal = match final_state {
+        GenomeState::UtrI => Some(35),
+        GenomeState::UtrD => Some(36),
+        GenomeState::CdsI => Some(59),
+        GenomeState::CdsD => Some(79),
+        _ => None,
+    };
+    if let Some(transition_id) = terminal {
+        raw_trace.push(RawStep {
+            transition_id,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: if genome_state_is_coding(final_state) {
+            89
+        } else {
+            39
+        },
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    raw_trace.push(RawStep {
+        transition_id: 90,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
     Alignment {
         query_id: query.id.clone(),
         target_id: target.id.clone(),
@@ -6526,9 +7553,48 @@ pub fn align_genome_to_genome(
         target_len: target.bases.len() as u64,
         target_strand: Strand::Forward,
         score,
-        raw_trace: Vec::new(),
+        raw_trace,
         trace,
     }
+}
+
+pub fn align_genome_to_genome(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+) -> Alignment {
+    align_genome_to_genome_forbidden(query, target, scoring, intron, None)
+}
+
+pub fn align_genome_to_genome_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        align_genome_to_genome_forbidden(query, target, scoring, intron, Some(forbidden))
+    })
+}
+
+pub fn align_genome_to_genome_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_genome_to_genome_suboptimal(
+                query, target, scoring, intron, threshold,
+            ));
+        }
+    }
+    out
 }
 
 pub fn align_genome_to_genome_database(
@@ -6575,6 +7641,7 @@ pub fn align_protein_to_genome(
         intron,
         Strand::Forward,
         false,
+        None,
     )];
     if both_strands {
         let reverse = reverse_complement(&target.bases);
@@ -6586,6 +7653,7 @@ pub fn align_protein_to_genome(
             intron,
             Strand::Reverse,
             false,
+            None,
         ));
     }
     out
@@ -6606,6 +7674,7 @@ pub fn align_protein_to_genome_bestfit(
         intron,
         Strand::Forward,
         true,
+        None,
     )];
     if both_strands {
         let reverse = reverse_complement(&target.bases);
@@ -6617,6 +7686,7 @@ pub fn align_protein_to_genome_bestfit(
             intron,
             Strand::Reverse,
             true,
+            None,
         ));
     }
     out
@@ -6636,6 +7706,310 @@ pub fn protein2genome_score_with_scoring(
         .unwrap_or(0)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn protein2genome_raw_fragment(
+    parent: P2GenomeParent,
+    destination: State,
+    query_end: usize,
+    target_end: usize,
+    query: &Sequence,
+    target: &[u8],
+    scoring: Scoring,
+    intron: IntronScoring,
+) -> Vec<RawStep> {
+    let (_, target_advance) = parent.fragment.advances();
+    let target_start = target_end - target_advance;
+    let mut raw = Vec::new();
+    if destination == State::M {
+        let epsilon = match parent.state {
+            State::I => Some(6),
+            State::D => Some(7),
+            _ => None,
+        };
+        if let Some(transition_id) = epsilon {
+            raw.push(RawStep {
+                transition_id,
+                query_advance: 0,
+                target_advance: 0,
+                score: 0,
+            });
+        }
+    }
+    let atoms = parent
+        .fragment
+        .atoms
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if atoms.iter().any(|run| run.op == Op::Intron) {
+        let phase = atoms
+            .iter()
+            .find(|run| run.op == Op::SplitCodon)
+            .map_or(0, |run| run.target_advance);
+        let post_len = 3 - phase;
+        let donor = target_start + phase as usize;
+        let post_start = target_end - post_len as usize;
+        if phase > 0 {
+            raw.push(RawStep {
+                transition_id: 100 + phase as u16,
+                query_advance: 0,
+                target_advance: phase,
+                score: 0,
+            });
+        }
+        raw.push(RawStep {
+            transition_id: 110 + phase as u16,
+            query_advance: 0,
+            target_advance: 2,
+            score: intron.open_penalty.saturating_add(
+                splice_score(target, donor, SpliceType::DonorForward, intron.force_gtag)
+                    .unwrap_or(0),
+            ),
+        });
+        let loop_len = post_start - donor - 4;
+        for _ in 0..loop_len {
+            raw.push(RawStep {
+                transition_id: 120 + phase as u16,
+                query_advance: 0,
+                target_advance: 1,
+                score: 0,
+            });
+        }
+        raw.push(RawStep {
+            transition_id: 130 + phase as u16,
+            query_advance: 0,
+            target_advance: 2,
+            score: splice_score(
+                target,
+                post_start - 2,
+                SpliceType::AcceptorForward,
+                intron.force_gtag,
+            )
+            .unwrap_or(0),
+        });
+        let mut codon = Vec::with_capacity(3);
+        codon.extend_from_slice(&target[target_start..donor]);
+        codon.extend_from_slice(&target[post_start..target_end]);
+        raw.push(RawStep {
+            transition_id: 140 + phase as u16,
+            query_advance: 1,
+            target_advance: post_len,
+            score: protein_score(
+                query.bases[query_end - 1],
+                translate_dna(&codon, 0)[0],
+                scoring,
+            ),
+        });
+        return raw;
+    }
+    let run = atoms[0];
+    match run.op {
+        Op::Match => raw.push(RawStep {
+            transition_id: 1,
+            query_advance: 1,
+            target_advance: 3,
+            score: protein_score(
+                query.bases[query_end - 1],
+                translate_dna(&target[target_end - 3..target_end], 0)[0],
+                scoring,
+            ),
+        }),
+        Op::Insert | Op::Delete => raw.push(RawStep {
+            transition_id: run.transition_id,
+            query_advance: run.query_advance,
+            target_advance: run.target_advance,
+            score: if matches!(run.transition_id, 2 | 3) {
+                scoring.codon_gap_open
+            } else {
+                scoring.codon_gap_extend
+            },
+        }),
+        Op::Frameshift => {
+            let short = run.target_advance % 3;
+            raw.push(RawStep {
+                transition_id: if short == 1 { 8 } else { 9 },
+                query_advance: 0,
+                target_advance: short,
+                score: scoring.frameshift,
+            });
+            raw.push(RawStep {
+                transition_id: if run.target_advance > 3 { 11 } else { 10 },
+                query_advance: 0,
+                target_advance: if run.target_advance > 3 { 3 } else { 0 },
+                score: 0,
+            });
+        }
+        _ => unreachable!("protein2genome parent fragment"),
+    }
+    raw
+}
+
+#[allow(clippy::too_many_arguments)]
+fn coding2genome_raw_fragment(
+    parent: P2GenomeParent,
+    destination: State,
+    query_end: usize,
+    target_end: usize,
+    query: &Sequence,
+    target: &[u8],
+    scoring: Scoring,
+    intron: IntronScoring,
+) -> Vec<RawStep> {
+    let (query_advance, target_advance) = parent.fragment.advances();
+    let query_start = query_end - query_advance;
+    let target_start = target_end - target_advance;
+    let mut raw = Vec::new();
+    if destination == State::M {
+        let epsilon = match parent.state {
+            State::I => Some(4),
+            State::D => Some(7),
+            _ => None,
+        };
+        if let Some(transition_id) = epsilon {
+            raw.push(RawStep {
+                transition_id,
+                query_advance: 0,
+                target_advance: 0,
+                score: 0,
+            });
+        }
+    }
+    let atoms = parent
+        .fragment
+        .atoms
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    if atoms.iter().any(|run| run.op == Op::Intron) {
+        let phase = atoms
+            .iter()
+            .find(|run| run.op == Op::SplitCodon)
+            .map_or(0, |run| run.target_advance);
+        let post_len = 3 - phase;
+        let donor = target_start + phase as usize;
+        let post_start = target_end - post_len as usize;
+        if phase > 0 {
+            raw.push(RawStep {
+                transition_id: 100 + phase as u16,
+                query_advance: phase,
+                target_advance: phase,
+                score: 0,
+            });
+        }
+        raw.push(RawStep {
+            transition_id: 110 + phase as u16,
+            query_advance: 0,
+            target_advance: 2,
+            score: intron.open_penalty.saturating_add(
+                splice_score(target, donor, SpliceType::DonorForward, intron.force_gtag)
+                    .unwrap_or(0),
+            ),
+        });
+        let loop_len = post_start - donor - 4;
+        for _ in 0..loop_len {
+            raw.push(RawStep {
+                transition_id: 120 + phase as u16,
+                query_advance: 0,
+                target_advance: 1,
+                score: 0,
+            });
+        }
+        raw.push(RawStep {
+            transition_id: 130 + phase as u16,
+            query_advance: 0,
+            target_advance: 2,
+            score: splice_score(
+                target,
+                post_start - 2,
+                SpliceType::AcceptorForward,
+                intron.force_gtag,
+            )
+            .unwrap_or(0),
+        });
+        let mut target_codon = Vec::with_capacity(3);
+        target_codon.extend_from_slice(&target[target_start..donor]);
+        target_codon.extend_from_slice(&target[post_start..target_end]);
+        raw.push(RawStep {
+            transition_id: 140 + phase as u16,
+            query_advance: post_len,
+            target_advance: post_len,
+            score: protein_score(
+                translate_dna(&query.bases[query_start..query_end], 0)[0],
+                translate_dna(&target_codon, 0)[0],
+                scoring,
+            ),
+        });
+        return raw;
+    }
+    let run = atoms[0];
+    match run.op {
+        Op::Match => raw.push(RawStep {
+            transition_id: 1,
+            query_advance: 3,
+            target_advance: 3,
+            score: protein_score(
+                translate_dna(&query.bases[query_end - 3..query_end], 0)[0],
+                translate_dna(&target[target_end - 3..target_end], 0)[0],
+                scoring,
+            ),
+        }),
+        Op::Insert => raw.push(RawStep {
+            transition_id: if run.transition_id == 2 { 2 } else { 3 },
+            query_advance: 3,
+            target_advance: 0,
+            score: if run.transition_id == 2 {
+                scoring.codon_gap_open
+            } else {
+                scoring.codon_gap_extend
+            },
+        }),
+        Op::Delete => raw.push(RawStep {
+            transition_id: if run.transition_id == 3 { 5 } else { 6 },
+            query_advance: 0,
+            target_advance: 3,
+            score: if run.transition_id == 3 {
+                scoring.codon_gap_open
+            } else {
+                scoring.codon_gap_extend
+            },
+        }),
+        Op::Frameshift => {
+            if run.query_advance > 0 {
+                let short = run.query_advance % 3;
+                raw.push(RawStep {
+                    transition_id: if short == 1 { 8 } else { 9 },
+                    query_advance: short,
+                    target_advance: 0,
+                    score: scoring.frameshift,
+                });
+                raw.push(RawStep {
+                    transition_id: if run.query_advance > 3 { 11 } else { 10 },
+                    query_advance: if run.query_advance > 3 { 3 } else { 0 },
+                    target_advance: 0,
+                    score: 0,
+                });
+            } else {
+                let short = run.target_advance % 3;
+                raw.push(RawStep {
+                    transition_id: if short == 1 { 12 } else { 13 },
+                    query_advance: 0,
+                    target_advance: short,
+                    score: scoring.frameshift,
+                });
+                raw.push(RawStep {
+                    transition_id: if run.target_advance > 3 { 15 } else { 14 },
+                    query_advance: 0,
+                    target_advance: if run.target_advance > 3 { 3 } else { 0 },
+                    score: 0,
+                });
+            }
+        }
+        _ => unreachable!("coding2genome parent fragment"),
+    }
+    raw
+}
+
+#[allow(clippy::too_many_arguments)]
 fn protein2genome_alignment_oriented(
     query: &Sequence,
     target: &Sequence,
@@ -6644,6 +8018,7 @@ fn protein2genome_alignment_oriented(
     intron: IntronScoring,
     strand: Strand,
     bestfit: bool,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
     let (n, m, cols) = (query.bases.len(), bases.len(), bases.len() + 1);
     let size = (n + 1) * (m + 1);
@@ -6712,6 +8087,9 @@ fn protein2genome_alignment_oriented(
                     continue;
                 };
                 let pre_start = candidate.start - phase;
+                if forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, post_start))) {
+                    continue;
+                }
                 let mut codon = Vec::with_capacity(3);
                 codon.extend_from_slice(&bases[pre_start..candidate.start]);
                 codon.extend_from_slice(&bases[post_start..j]);
@@ -6840,7 +8218,7 @@ fn protein2genome_alignment_oriented(
                     });
                 }
             }
-            if j >= 3 {
+            if j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 3))) {
                 let p = idx(i - 1, j - 3, cols);
                 let aa = translate_dna(&bases[j - 3..j], 0)[0];
                 let sub = protein_score(query.bases[i - 1], aa, scoring);
@@ -6908,6 +8286,7 @@ fn protein2genome_alignment_oriented(
             .all(|parent| parent.state != State::Stop && parent.fragment.atoms[0].is_some())
     );
     let (mut i, mut j, mut state, score) = end;
+    let final_state = state;
     let (query_end, oriented_target_end) = (i as u64, j as u64);
     let mut fragments = Vec::new();
     while state != State::Stop {
@@ -6918,6 +8297,8 @@ fn protein2genome_alignment_oriented(
             State::Stop => None,
         };
         let Some(parent) = parent else { break };
+        let raw_fragment =
+            protein2genome_raw_fragment(parent, state, i, j, query, bases, scoring, intron);
         let (query_advance, target_advance) =
             parent
                 .fragment
@@ -6933,14 +8314,43 @@ fn protein2genome_alignment_oriented(
         debug_assert!(i >= query_advance && j >= target_advance);
         i -= query_advance;
         j -= target_advance;
-        fragments.push(parent.fragment);
+        fragments.push((parent.fragment, raw_fragment));
         state = parent.state;
     }
     fragments.reverse();
     let mut trace = Vec::new();
-    for fragment in fragments {
+    let mut raw_trace = vec![RawStep {
+        transition_id: 0,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    }];
+    for (fragment, raw_fragment) in fragments {
         fragment.append_to(&mut trace);
+        raw_trace.extend(raw_fragment);
     }
+    if final_state == State::I {
+        raw_trace.push(RawStep {
+            transition_id: 6,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    if final_state == State::D {
+        raw_trace.push(RawStep {
+            transition_id: 7,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: 12,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
     let (target_start, target_end) = match strand {
         Strand::Forward => (j as u64, oriented_target_end),
         Strand::Reverse => (
@@ -6960,9 +8370,79 @@ fn protein2genome_alignment_oriented(
         target_len: target.bases.len() as u64,
         target_strand: strand,
         score,
-        raw_trace: Vec::new(),
+        raw_trace,
         trace,
     }
+}
+
+pub fn align_protein_to_genome_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+    bestfit: bool,
+) -> Vec<Alignment> {
+    let mut out = enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        protein2genome_alignment_oriented(
+            query,
+            target,
+            &target.bases,
+            scoring,
+            intron,
+            Strand::Forward,
+            bestfit,
+            Some(forbidden),
+        )
+    });
+    if both_strands {
+        let reverse = reverse_complement(&target.bases);
+        out.extend(enumerate_suboptimal_pair(
+            query,
+            target,
+            threshold,
+            |forbidden| {
+                protein2genome_alignment_oriented(
+                    query,
+                    target,
+                    &reverse,
+                    scoring,
+                    intron,
+                    Strand::Reverse,
+                    bestfit,
+                    Some(forbidden),
+                )
+            },
+        ));
+    }
+    out
+}
+
+pub fn align_protein_to_genome_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+    bestfit: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_protein_to_genome_suboptimal(
+                query,
+                target,
+                scoring,
+                intron,
+                threshold,
+                both_strands,
+                bestfit,
+            ));
+        }
+    }
+    out
 }
 
 pub fn align_protein_to_genome_bestfit_database(
@@ -7029,6 +8509,7 @@ pub fn align_coding_to_genome(
         scoring,
         intron,
         Strand::Forward,
+        None,
     )];
     if both_strands {
         let reverse = reverse_complement(&target.bases);
@@ -7039,6 +8520,7 @@ pub fn align_coding_to_genome(
             scoring,
             intron,
             Strand::Reverse,
+            None,
         ));
     }
     out
@@ -7065,6 +8547,7 @@ fn coding2genome_alignment_oriented(
     scoring: Scoring,
     intron: IntronScoring,
     strand: Strand,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
     let (n, m, cols) = (query.bases.len(), bases.len(), bases.len() + 1);
     let size = (n + 1) * (m + 1);
@@ -7128,6 +8611,12 @@ fn coding2genome_alignment_oriented(
                         continue;
                     };
                     let pre_start = candidate.start - phase;
+                    if forbidden.is_some_and(|pairs| {
+                        pairs.contains(&(i - 3, pre_start))
+                            || pairs.contains(&(i - post_len, post_start))
+                    }) {
+                        continue;
+                    }
                     let mut codon = Vec::with_capacity(3);
                     codon.extend_from_slice(&bases[pre_start..candidate.start]);
                     codon.extend_from_slice(&bases[post_start..j]);
@@ -7276,7 +8765,7 @@ fn coding2genome_alignment_oriented(
                     });
                 }
             }
-            if i >= 3 && j >= 3 {
+            if i >= 3 && j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
                 let p = idx(i - 3, j - 3, cols);
                 let aa = translate_dna(&bases[j - 3..j], 0)[0];
                 let sub = protein_score(translate_dna(&query.bases[i - 3..i], 0)[0], aa, scoring);
@@ -7344,6 +8833,7 @@ fn coding2genome_alignment_oriented(
             .all(|parent| parent.state != State::Stop && parent.fragment.atoms[0].is_some())
     );
     let (mut i, mut j, mut state, score) = end;
+    let final_state = state;
     let (query_end, oriented_target_end) = (i as u64, j as u64);
     let mut fragments = Vec::new();
     while state != State::Stop {
@@ -7354,6 +8844,8 @@ fn coding2genome_alignment_oriented(
             State::Stop => None,
         };
         let Some(parent) = parent else { break };
+        let raw_fragment =
+            coding2genome_raw_fragment(parent, state, i, j, query, bases, scoring, intron);
         let (query_advance, target_advance) =
             parent
                 .fragment
@@ -7369,14 +8861,43 @@ fn coding2genome_alignment_oriented(
         debug_assert!(i >= query_advance && j >= target_advance);
         i -= query_advance;
         j -= target_advance;
-        fragments.push(parent.fragment);
+        fragments.push((parent.fragment, raw_fragment));
         state = parent.state;
     }
     fragments.reverse();
     let mut trace = Vec::new();
-    for fragment in fragments {
+    let mut raw_trace = vec![RawStep {
+        transition_id: 0,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    }];
+    for (fragment, raw_fragment) in fragments {
         fragment.append_to(&mut trace);
+        raw_trace.extend(raw_fragment);
     }
+    if final_state == State::I {
+        raw_trace.push(RawStep {
+            transition_id: 4,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    if final_state == State::D {
+        raw_trace.push(RawStep {
+            transition_id: 7,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: 16,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
     let (target_start, target_end) = match strand {
         Strand::Forward => (j as u64, oriented_target_end),
         Strand::Reverse => (
@@ -7390,15 +8911,80 @@ fn coding2genome_alignment_oriented(
         target_id: target.id.clone(),
         query_start: i as u64,
         query_end,
-        query_strand: Strand::Unknown,
+        query_strand: Strand::Forward,
         target_start,
         target_end,
         target_len: target.bases.len() as u64,
         target_strand: strand,
         score,
-        raw_trace: Vec::new(),
+        raw_trace,
         trace,
     }
+}
+
+pub fn align_coding_to_genome_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        coding2genome_alignment_oriented(
+            query,
+            target,
+            &target.bases,
+            scoring,
+            intron,
+            Strand::Forward,
+            Some(forbidden),
+        )
+    });
+    if both_strands {
+        let reverse = reverse_complement(&target.bases);
+        out.extend(enumerate_suboptimal_pair(
+            query,
+            target,
+            threshold,
+            |forbidden| {
+                coding2genome_alignment_oriented(
+                    query,
+                    target,
+                    &reverse,
+                    scoring,
+                    intron,
+                    Strand::Reverse,
+                    Some(forbidden),
+                )
+            },
+        ));
+    }
+    out
+}
+
+pub fn align_coding_to_genome_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_coding_to_genome_suboptimal(
+                query,
+                target,
+                scoring,
+                intron,
+                threshold,
+                both_strands,
+            ));
+        }
+    }
+    out
 }
 
 /// Align every coding-DNA/genome pair, emitting one alignment per requested target strand.
@@ -7430,6 +9016,7 @@ fn align_protein_to_dna_direct(
     model: Model,
     scoring: Scoring,
     strand: Strand,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
     let oriented = if strand == Strand::Forward {
         target.bases.clone()
@@ -7525,19 +9112,22 @@ fn align_protein_to_dna_direct(
                 let aa = translate_dna(&oriented[j - 3..j], 0)[0];
                 let sub = protein_score(query.bases[i - 1], aa, scoring);
                 let mut candidate = (NEG_INF, State::Stop, None);
-                for (value, state) in [(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)] {
-                    p2_update(
-                        &mut candidate,
-                        add(value, sub),
-                        state,
-                        P2Parent {
+                if !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 3))) {
+                    for (value, state) in [(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]
+                    {
+                        p2_update(
+                            &mut candidate,
+                            add(value, sub),
                             state,
-                            op: Op::Match,
-                            transition_id: 1,
-                            query_advance: 1,
-                            target_advance: 3,
-                        },
-                    );
+                            P2Parent {
+                                state,
+                                op: Op::Match,
+                                transition_id: 1,
+                                query_advance: 1,
+                                target_advance: 3,
+                            },
+                        );
+                    }
                 }
                 for advance in [1_usize, 2, 4, 5] {
                     if j < advance {
@@ -7760,6 +9350,7 @@ pub fn align_protein_to_dna(
         model,
         scoring,
         Strand::Forward,
+        None,
     ));
     if both_strands {
         out.push(align_protein_to_dna_direct(
@@ -7768,7 +9359,72 @@ pub fn align_protein_to_dna(
             model,
             scoring,
             Strand::Reverse,
+            None,
         ));
+    }
+    out
+}
+
+/// Pair-disjoint suboptimal protein-to-DNA paths, enumerated independently
+/// on each requested target orientation.
+pub fn align_protein_to_dna_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    model: Model,
+    scoring: Scoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        align_protein_to_dna_direct(
+            query,
+            target,
+            model,
+            scoring,
+            Strand::Forward,
+            Some(forbidden),
+        )
+    });
+    if both_strands {
+        out.extend(enumerate_suboptimal_pair(
+            query,
+            target,
+            threshold,
+            |forbidden| {
+                align_protein_to_dna_direct(
+                    query,
+                    target,
+                    model,
+                    scoring,
+                    Strand::Reverse,
+                    Some(forbidden),
+                )
+            },
+        ));
+    }
+    out
+}
+
+pub fn align_protein_to_dna_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    model: Model,
+    scoring: Scoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_protein_to_dna_suboptimal(
+                query,
+                target,
+                model,
+                scoring,
+                threshold,
+                both_strands,
+            ));
+        }
     }
     out
 }
@@ -8123,6 +9779,34 @@ mod tests {
     }
 
     #[test]
+    fn suboptimal_coding_paths_are_score_ordered_and_pair_disjoint() {
+        let query = s("query", "ATGGCTATGGCT");
+        let target = s("target", "ATGGCTTTTATGGCT");
+        let alignments = align_coding2coding_suboptimal(&query, &target, Scoring::default(), 5);
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(
+            alignments
+                .windows(2)
+                .all(|pair| pair[0].score >= pair[1].score)
+        );
+        assert_eq!(
+            alignments[0].vulgar(),
+            align_coding2coding(&query, &target, Scoring::default()).vulgar()
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in &alignments {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
+    }
+
+    #[test]
     fn suboptimal_local_paths_are_score_ordered_and_pair_disjoint() {
         let query = s("query", "ACGTACGTACGT");
         let target = s("target", "ACGTGGGGACGT");
@@ -8213,6 +9897,14 @@ mod tests {
             "vulgar: protein 0 3 . genome 0 6 + -8 G 1 0 M 2 6"
         );
         assert!(bestfit.score < local.score);
+        assert_eq!(
+            bestfit
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            bestfit.score
+        );
         let query_span = bestfit
             .trace
             .iter()
@@ -8241,6 +9933,50 @@ mod tests {
     }
 
     #[test]
+    fn suboptimal_protein2genome_recovers_two_phase_intron_loci() {
+        let query = Sequence {
+            id: "protein".into(),
+            bases: b"MADQLTEQIAEFKEAFSLFDKDGDGTITT".to_vec(),
+        };
+        let locus = b"ATGGCTGACCAGCTGACTGAGCAGATTGCAGAGTTCAAGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAGGGAGGCCTTCTCCCTCTTTGACAAGGATGGAGATGGCACTATTACCACC";
+        let mut bases = locus.to_vec();
+        bases.extend_from_slice(&[b'N'; 20]);
+        bases.extend_from_slice(locus);
+        let target = Sequence {
+            id: "genome".into(),
+            bases,
+        };
+        let alignments = align_protein_to_genome_suboptimal(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            100,
+            false,
+            false,
+        );
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(alignments[0].score >= alignments[1].score);
+        assert!(
+            alignments
+                .iter()
+                .take(2)
+                .all(|alignment| alignment.trace.iter().any(|run| run.op == Op::Intron))
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in alignments.iter().take(2) {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
+    }
+
+    #[test]
     fn protein2genome_matches_upstream_phase_intron_oracle() {
         let query = Sequence {
             id: "protein".into(),
@@ -8260,6 +9996,38 @@ mod tests {
         .pop()
         .expect("one forward protein2genome alignment");
         assert_eq!(alignment.score, 125);
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            alignment.score
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.query_advance))
+                .sum::<u64>(),
+            alignment.query_end - alignment.query_start
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.target_advance))
+                .sum::<u64>(),
+            alignment.target_end - alignment.target_start
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .filter(|step| step.transition_id == 122)
+                .count(),
+            42
+        );
         assert_eq!(
             (
                 alignment.query_start,
@@ -8295,6 +10063,55 @@ mod tests {
     }
 
     #[test]
+    fn suboptimal_genome2genome_recovers_two_spliced_loci() {
+        let query = s(
+            "query",
+            concat!(
+                "AGCCCAGCCAAGCACTGTCAGGAATCCTG",
+                "GTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAG",
+                "TGAAGCAGCTCCAGCTATGTGTGAAGAA",
+                "GAGGACAGCACTGCCTTGGTGTGTGACAATG",
+                "GTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAG",
+                "GCTCTGGGCTCTGTAAGGCCGGCTTTGCT"
+            ),
+        );
+        let locus = concat!(
+            "AGCCCAGCCAAGCACTGTCAGGAATCCTG",
+            "GTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAG",
+            "TGAAGCAGCTCCAGCTATGTGTGAAGAA",
+            "GAGGACAGCACTGCCTTGGTGTGTGACAATGGC",
+            "TCTGGGCTCTGTAAGGCCGGCTTTGCT"
+        );
+        let target = s("target", &format!("{locus}{}{}", "N".repeat(20), locus));
+        let alignments = align_genome_to_genome_suboptimal(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            400,
+        );
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(alignments[0].score >= alignments[1].score);
+        assert!(
+            alignments
+                .iter()
+                .take(2)
+                .all(|alignment| alignment.trace.iter().any(|run| run.op == Op::Intron))
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in alignments.iter().take(2) {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
+    }
+
+    #[test]
     fn genome2genome_matches_upstream_joint_intron_oracle() {
         let query = s(
             "query",
@@ -8324,11 +10141,38 @@ mod tests {
             IntronScoring::default(),
         );
         assert_eq!(alignment.score, 557);
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            alignment.score
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.query_advance))
+                .sum::<u64>(),
+            alignment.query_end - alignment.query_start
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.target_advance))
+                .sum::<u64>(),
+            alignment.target_end - alignment.target_start
+        );
         assert_eq!(alignment.query_start, 0);
         assert_eq!(alignment.target_start, 0);
         assert!(alignment.trace.iter().any(|run| run.op == Op::Intron));
         assert!(alignment.trace.iter().any(|run| {
-            run.op == Op::Intron && run.query_advance > 0 && run.target_advance > 0
+            run.op == Op::Intron && run.query_advance == 0 && run.target_advance > 0
+        }));
+        assert!(alignment.trace.iter().any(|run| {
+            run.op == Op::Intron && run.query_advance > 0 && run.target_advance == 0
         }));
         let (query_span, target_span) =
             alignment.trace.iter().fold((0_u64, 0_u64), |(q, t), run| {
@@ -8407,7 +10251,9 @@ mod tests {
             );
             assert!(
                 joint.trace.iter().any(|run| {
-                    run.op == Op::Intron && run.query_advance > 0 && run.target_advance > 0
+                    run.op == Op::Intron && run.query_advance == 0 && run.target_advance > 0
+                }) && joint.trace.iter().any(|run| {
+                    run.op == Op::Intron && run.query_advance > 0 && run.target_advance == 0
                 }),
                 "missing joint phase {phase}: {}",
                 joint.vulgar()
@@ -8427,6 +10273,39 @@ mod tests {
                 });
             assert_eq!(query_span, joint.query_end - joint.query_start);
             assert_eq!(target_span, joint.target_end - joint.target_start);
+        }
+    }
+
+    #[test]
+    fn suboptimal_cdna2genome_recovers_two_spliced_loci() {
+        let query = s("cdna", "ACGTACGT");
+        let locus = format!("ACGTGT{}AGACGT", "N".repeat(30));
+        let target = s("genome", &format!("{locus}{}{}", "N".repeat(20), locus));
+        let intron = IntronScoring {
+            open_penalty: -1,
+            force_gtag: true,
+            ..IntronScoring::default()
+        };
+        let alignments =
+            align_cdna_to_genome_suboptimal(&query, &target, Scoring::default(), intron, 5);
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(alignments[0].score >= alignments[1].score);
+        assert!(
+            alignments
+                .iter()
+                .take(2)
+                .all(|alignment| alignment.trace.iter().any(|run| run.op == Op::Intron))
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in alignments.iter().take(2) {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
         }
     }
 
@@ -8462,6 +10341,7 @@ mod tests {
             &target,
             Scoring::default(),
             IntronScoring::default(),
+            None,
         );
         assert_eq!(
             dp.value(dp.end.2, idx(dp.end.0, dp.end.1, dp.cols)),
@@ -8474,6 +10354,42 @@ mod tests {
             IntronScoring::default(),
         );
         assert_eq!(alignment.score, 1281);
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            alignment.score
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.query_advance))
+                .sum::<u64>(),
+            alignment.query_end - alignment.query_start
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.target_advance))
+                .sum::<u64>(),
+            alignment.target_end - alignment.target_start
+        );
+        assert!(
+            alignment
+                .raw_trace
+                .iter()
+                .any(|step| step.transition_id == 321)
+        );
+        assert!(
+            alignment
+                .raw_trace
+                .iter()
+                .any(|step| step.transition_id == 400)
+        );
         assert_eq!(
             (
                 alignment.query_start,
@@ -8503,6 +10419,49 @@ mod tests {
     }
 
     #[test]
+    fn suboptimal_coding2genome_recovers_two_phase_intron_loci() {
+        let query = s(
+            "coding",
+            "AGCCCAGCCAAGCACTGTCAGGAATCCTGTGAAGCAGCTCCAGCTATGTGTGAAGAAGAGGACAGCACTGCCTTGGTGTGTGACAATGGCTCTGGGCTCTGTAAGGCCGGCTTTGCT",
+        );
+        let locus = b"AGCCCAGCCAAGCACTGTCAGGAATCCTGGTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAGTGAAGCAGCTCCAGCTATGTGTGAAGAAGAGGACAGCACTGCCTTGGTGTGTGACAATGGCTCTGGGCTCTGTAAGGCCGGCTTTGCT";
+        let mut bases = locus.to_vec();
+        bases.extend_from_slice(&[b'N'; 20]);
+        bases.extend_from_slice(locus);
+        let target = Sequence {
+            id: "genome".into(),
+            bases,
+        };
+        let alignments = align_coding_to_genome_suboptimal(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            150,
+            false,
+        );
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(alignments[0].score >= alignments[1].score);
+        assert!(
+            alignments
+                .iter()
+                .take(2)
+                .all(|alignment| alignment.trace.iter().any(|run| run.op == Op::Intron))
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in alignments.iter().take(2) {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
+    }
+
+    #[test]
     fn coding2genome_matches_upstream_phase_intron_oracle() {
         let query = s(
             "coding",
@@ -8523,6 +10482,38 @@ mod tests {
         .expect("one forward coding2genome alignment");
         assert_eq!(alignment.score, 194);
         assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            alignment.score
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.query_advance))
+                .sum::<u64>(),
+            alignment.query_end - alignment.query_start
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.target_advance))
+                .sum::<u64>(),
+            alignment.target_end - alignment.target_start
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .filter(|step| step.transition_id == 122)
+                .count(),
+            30
+        );
+        assert_eq!(
             (
                 alignment.query_start,
                 alignment.query_end,
@@ -8533,7 +10524,7 @@ mod tests {
         );
         assert_eq!(
             alignment.vulgar(),
-            "vulgar: coding 0 117 . genome 0 151 + 194 M 27 27 S 2 2 5 0 2 I 0 30 3 0 2 S 1 1 M 87 87"
+            "vulgar: coding 0 117 + genome 0 151 + 194 C 27 27 S 2 2 5 0 2 I 0 30 3 0 2 S 1 1 C 87 87"
         );
         assert!(alignment.trace.iter().any(|run| run.op == Op::SplitCodon));
         assert!(alignment.trace.iter().any(|run| run.op == Op::Intron));
@@ -8554,6 +10545,42 @@ mod tests {
         .expect("reverse-strand coding2genome alignment");
         assert_eq!(reverse.score, 194);
         assert_eq!((reverse.target_start, reverse.target_end), (0, 151));
+    }
+
+    #[test]
+    fn suboptimal_protein2dna_paths_are_pair_disjoint() {
+        let query = s("protein", "MA");
+        let target = s("target", "ATGGCTNNNNNNATGGCT");
+        let alignments = align_protein_to_dna_suboptimal(
+            &query,
+            &target,
+            Model::Local,
+            Scoring::default(),
+            5,
+            false,
+        );
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(
+            alignments
+                .windows(2)
+                .all(|pair| pair[0].score >= pair[1].score)
+        );
+        assert_eq!(
+            alignments[0].vulgar(),
+            align_protein_to_dna(&query, &target, Model::Local, Scoring::default(), false,)[0]
+                .vulgar()
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in &alignments {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
     }
 
     #[test]
@@ -8921,6 +10948,46 @@ mod tests {
         out
     }
     #[test]
+    fn suboptimal_est2genome_recovers_two_spliced_loci() {
+        let source = include_str!("../../../upstream/src/model/est2genome.test.c");
+        let query = Sequence {
+            id: "query".into(),
+            bases: c_concat(source, "*query_seq =").into_bytes(),
+        };
+        let locus = c_concat(source, "*target_seq =").into_bytes();
+        let mut duplicated = locus.clone();
+        duplicated.extend_from_slice(&[b'N'; 20]);
+        duplicated.extend_from_slice(&locus);
+        let target = Sequence {
+            id: "target".into(),
+            bases: duplicated,
+        };
+        let alignments =
+            align_est2genome_suboptimal(&query, &target, IntronScoring::default(), 100, false);
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(alignments[0].score >= 100);
+        assert!(alignments[1].score >= 100);
+        assert!(alignments[0].score >= alignments[1].score);
+        assert!(
+            alignments
+                .iter()
+                .take(2)
+                .all(|alignment| alignment.trace.iter().any(|run| run.op == Op::Intron))
+        );
+        let mut forbidden = HashSet::new();
+        for alignment in alignments.iter().take(2) {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
+    }
+
+    #[test]
     fn est2genome_gff3_splits_match_parts_at_intron() {
         let source = include_str!("../../../upstream/src/model/est2genome.test.c");
         let query = Sequence {
@@ -9045,6 +11112,36 @@ mod tests {
             alignment.target_end - alignment.target_start
         );
         assert!(alignment.trace.iter().any(|run| run.op == Op::Frameshift));
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            alignment.score
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.query_advance))
+                .sum::<u64>(),
+            query_advance
+        );
+        assert_eq!(
+            alignment
+                .raw_trace
+                .iter()
+                .map(|step| u64::from(step.target_advance))
+                .sum::<u64>(),
+            target_advance
+        );
+        assert!(
+            alignment
+                .raw_trace
+                .iter()
+                .any(|step| matches!(step.transition_id, 8 | 9 | 12 | 13))
+        );
     }
 
     #[test]
