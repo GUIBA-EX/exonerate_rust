@@ -45,6 +45,457 @@ fn help_and_version_aliases_are_available_without_fasta_inputs() {
 }
 
 #[test]
+fn exhaustive_ungapped_reports_and_score_boundary_match_the_upstream_oracle() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    let common = [
+        "--model",
+        "ungapped",
+        "--exhaustive",
+        "yes",
+        "--revcomp",
+        "no",
+        "--subopt",
+        "no",
+        "--showalignment",
+        "no",
+        "--showsugar",
+        "yes",
+        "--showcigar",
+        "yes",
+        "--showvulgar",
+        "yes",
+    ];
+    let mut passing = common.to_vec();
+    passing.extend([
+        "--score",
+        "40",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        run(&passing),
+        concat!(
+            "sugar: q 0 8 + t 2 10 + 40\n",
+            "cigar: q 0 8 + t 2 10 + 40  M 8\n",
+            "vulgar: q 0 8 + t 2 10 + 40 M 8 8\n",
+        )
+    );
+
+    let mut filtered = common.to_vec();
+    filtered.extend([
+        "--score",
+        "41",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(run(&filtered), "");
+}
+
+#[test]
+fn ungapped_bestn_retains_tied_dna_and_protein_hsps() {
+    for (query_name, target_name, query_type, score, expected) in [
+        (
+            "tie-dna-query.fa",
+            "tie-dna-target.fa",
+            "dna",
+            "40",
+            concat!(
+                "tie-query tie-target 40 0 8 0 8 1\n",
+                "tie-query tie-target 40 0 8 12 20 2\n",
+            ),
+        ),
+        (
+            "tie-protein-query.fa",
+            "tie-protein-target.fa",
+            "protein",
+            "44",
+            concat!(
+                "tie-protein-query tie-protein-target 44 0 4 0 4 1\n",
+                "tie-protein-query tie-protein-target 44 0 4 8 12 2\n",
+            ),
+        ),
+    ] {
+        let query = fixture(query_name);
+        let target = fixture(target_name);
+        assert_eq!(
+            run(&[
+                "--model",
+                "ungapped",
+                "--querytype",
+                query_type,
+                "--targettype",
+                query_type,
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "yes",
+                "--revcomp",
+                "no",
+                "--score",
+                score,
+                "--bestn",
+                "1",
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "no",
+                "--showcigar",
+                "no",
+                "--showvulgar",
+                "no",
+                "--ryo",
+                "%qi %ti %s %qab %qae %tab %tae %r\\n",
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]),
+            expected,
+            "unexpected ungapped {query_type} tie order"
+        );
+    }
+}
+
+#[test]
+fn protein_to_dna_ungapped_bestn_retains_tied_hsps() {
+    let query = fixture("tie-protein-query.fa");
+    let target = fixture("tie-protein-dna-target.fa");
+    assert_eq!(
+        run(&[
+            "--model",
+            "ungapped",
+            "--querytype",
+            "protein",
+            "--targettype",
+            "dna",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "yes",
+            "--revcomp",
+            "no",
+            "--score",
+            "44",
+            "--bestn",
+            "1",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "%qi %ti %s %qab %qae %tab %tae %r\\n",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]),
+        concat!(
+            "tie-protein-query tie-protein-dna-target 44 0 4 0 12 1\n",
+            "tie-protein-query tie-protein-dna-target 44 0 4 15 27 2\n",
+        )
+    );
+}
+
+#[test]
+fn bestn_multi_record_order_matches_the_upstream_oracle() {
+    let query = fixture("multi-order-query.fa");
+    let target = fixture("multi-order-target.fa");
+    assert_eq!(
+        run(&[
+            "--model",
+            "affine:local",
+            "--exhaustive",
+            "yes",
+            "--revcomp",
+            "no",
+            "--score",
+            "10",
+            "--bestn",
+            "1",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "%qi %ti %s %r\\n",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]),
+        concat!(
+            "a-second a-second-target 20 1\n",
+            "z-first z-first-target 40 1\n",
+        )
+    );
+}
+
+#[test]
+fn protein2genome_bestn_multi_record_order_matches_the_upstream_oracle() {
+    let query = fixture("multi-protein-query.fa");
+    let target = fixture("multi-protein-genome.fa");
+    assert_eq!(
+        run(&[
+            "--model",
+            "protein2genome",
+            "--exhaustive",
+            "yes",
+            "--revcomp",
+            "no",
+            "--minintron",
+            "30",
+            "--score",
+            "20",
+            "--bestn",
+            "1",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "%qi %ti %s %r\\n",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]),
+        concat!("a-protein a-genome 44 1\n", "z-protein z-genome 125 1\n",)
+    );
+}
+
+#[test]
+fn composed_multi_record_order_and_score_boundaries_match_the_upstream_oracle() {
+    let query = fixture("multi-coding-query.fa");
+    let target = fixture("multi-coding-genome.fa");
+    for (model, at_boundary, above_boundary, filtered) in [
+        (
+            "coding2genome",
+            concat!(
+                "z-coding z-coding-genome 20 0\n",
+                "a-coding a-coding-genome 44 0\n",
+            ),
+            "21",
+            "a-coding a-coding-genome 44 0\n",
+        ),
+        (
+            "cdna2genome",
+            concat!(
+                "z-coding z-coding-genome 60 0\n",
+                "z-coding a-coding-genome 28 0\n",
+                "a-coding z-coding-genome 28 0\n",
+                "a-coding a-coding-genome 60 0\n",
+            ),
+            "29",
+            concat!(
+                "z-coding z-coding-genome 60 0\n",
+                "a-coding a-coding-genome 60 0\n",
+            ),
+        ),
+        (
+            "genome2genome",
+            concat!(
+                "z-coding z-coding-genome 60 0\n",
+                "z-coding a-coding-genome 28 0\n",
+                "a-coding z-coding-genome 28 0\n",
+                "a-coding a-coding-genome 60 0\n",
+            ),
+            "29",
+            concat!(
+                "z-coding z-coding-genome 60 0\n",
+                "a-coding a-coding-genome 60 0\n",
+            ),
+        ),
+    ] {
+        let common = [
+            "--model",
+            model,
+            "--exhaustive",
+            "yes",
+            "--revcomp",
+            "no",
+            "--subopt",
+            "no",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "%qi %ti %s %r\\n",
+        ];
+        let mut boundary_arguments = common.to_vec();
+        boundary_arguments.extend([
+            "--score",
+            "20",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run(&boundary_arguments),
+            at_boundary,
+            "unexpected {model} multi-record order"
+        );
+
+        let mut filtered_arguments = common.to_vec();
+        filtered_arguments.extend([
+            "--score",
+            above_boundary,
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run(&filtered_arguments),
+            filtered,
+            "unexpected {model} score boundary"
+        );
+    }
+}
+
+#[test]
+fn est2genome_multi_record_order_and_score_boundary_match_the_upstream_oracle() {
+    let query = fixture("multi-coding-query.fa");
+    let target = fixture("multi-coding-genome.fa");
+    let common = [
+        "--model",
+        "est2genome",
+        "--exhaustive",
+        "yes",
+        "--revcomp",
+        "no",
+        "--subopt",
+        "no",
+        "--showalignment",
+        "no",
+        "--showsugar",
+        "no",
+        "--showcigar",
+        "no",
+        "--showvulgar",
+        "no",
+        "--ryo",
+        "%qi %ti %s %r\\n",
+    ];
+    let mut boundary_arguments = common.to_vec();
+    boundary_arguments.extend([
+        "--score",
+        "20",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        run(&boundary_arguments),
+        concat!(
+            "z-coding z-coding-genome 60 0\n",
+            "z-coding a-coding-genome 28 0\n",
+            "a-coding z-coding-genome 28 0\n",
+            "a-coding a-coding-genome 60 0\n",
+        )
+    );
+
+    let mut filtered_arguments = common.to_vec();
+    filtered_arguments.extend([
+        "--score",
+        "29",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        run(&filtered_arguments),
+        concat!(
+            "z-coding z-coding-genome 60 0\n",
+            "a-coding a-coding-genome 60 0\n",
+        )
+    );
+}
+
+#[test]
+fn ner_and_ungapped_trans_multi_record_order_match_the_upstream_oracle() {
+    let query = fixture("multi-coding-query.fa");
+    let target = fixture("multi-coding-genome.fa");
+    for (model, boundary, at_boundary, above_boundary, filtered) in [
+        (
+            "ner",
+            "20",
+            concat!(
+                "z-coding z-coding-genome 60 0\n",
+                "z-coding a-coding-genome 28 0\n",
+                "a-coding z-coding-genome 28 0\n",
+                "a-coding a-coding-genome 60 0\n",
+            ),
+            "29",
+            concat!(
+                "z-coding z-coding-genome 60 0\n",
+                "a-coding a-coding-genome 60 0\n",
+            ),
+        ),
+        (
+            "ungapped:trans",
+            "20",
+            concat!(
+                "z-coding z-coding-genome 20 0\n",
+                "a-coding a-coding-genome 44 0\n",
+            ),
+            "21",
+            "a-coding a-coding-genome 44 0\n",
+        ),
+    ] {
+        let common = [
+            "--model",
+            model,
+            "--exhaustive",
+            "yes",
+            "--revcomp",
+            "no",
+            "--subopt",
+            "no",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "%qi %ti %s %r\\n",
+        ];
+        let mut boundary_arguments = common.to_vec();
+        boundary_arguments.extend([
+            "--score",
+            boundary,
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run(&boundary_arguments),
+            at_boundary,
+            "unexpected {model} multi-record order"
+        );
+
+        let mut filtered_arguments = common.to_vec();
+        filtered_arguments.extend([
+            "--score",
+            above_boundary,
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run(&filtered_arguments),
+            filtered,
+            "unexpected {model} score boundary"
+        );
+    }
+}
+
+#[test]
 fn fasta_byte_chunks_match_the_upstream_record_boundaries() {
     let query = fixture("multi-query.fa");
     let target = fixture("multi-target.fa");
@@ -1789,6 +2240,27 @@ fn protein_affine_reports_match_the_upstream_oracle() {
 }
 
 #[test]
+fn pretty_protein_affine_identifies_the_upstream_model_name() {
+    let query = fixture("protein-query.fa");
+    let target = fixture("protein-target.fa");
+    let output = run(&[
+        "--model",
+        "affine:local",
+        "--showalignment",
+        "yes",
+        "--showsugar",
+        "no",
+        "--showcigar",
+        "no",
+        "--showvulgar",
+        "no",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(output.contains("         Model: affine:local:protein2protein\n"));
+}
+
+#[test]
 fn exhaustive_protein_affine_subopt_matches_the_upstream_oracle() {
     let query = fixture("protein-query.fa");
     let target = fixture("protein-target.fa");
@@ -1818,6 +2290,46 @@ fn exhaustive_protein_affine_subopt_matches_the_upstream_oracle() {
             target.to_str().unwrap(),
         ]),
         "vulgar: protein 0 29 . protein-target 2 31 . 146 M 29 29\n"
+    );
+}
+
+#[test]
+fn protein_affine_bestn_retains_tied_suboptimal_loci() {
+    let query = fixture("tie-protein-query.fa");
+    let target = fixture("tie-protein-target.fa");
+    assert_eq!(
+        run(&[
+            "--model",
+            "affine:local",
+            "--querytype",
+            "protein",
+            "--targettype",
+            "protein",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "yes",
+            "--score",
+            "44",
+            "--bestn",
+            "1",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "%qi %ti %s %qab %qae %tab %tae %r\\n",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]),
+        concat!(
+            "tie-protein-query tie-protein-target 44 0 4 0 4 1\n",
+            "tie-protein-query tie-protein-target 44 0 4 8 12 2\n",
+        )
     );
 }
 

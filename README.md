@@ -6,6 +6,13 @@ alignment for FASTA input, with deterministic traceback and sugar/cigar/vulgar/G
 --targettype dna`) with codon-affine gaps and target-side frameshift transitions;
 `protein2dna` is the intron-free model.  `protein2genome` is available for protein-to-genome local alignment with phase 0/1/2 introns, the upstream splice PSSM, and canonical split-codon/intron traceback.  `est2genome` is also available for local DNA-to-genome alignment with affine gaps, bounded target introns, upstream splice PSSMs, both target strands, and canonical intron traceback. A generic C4 graph executor is available as a library API, including bounded query-, target-, and joint-intron long states and target phase 0/1/2 codon shadows. NER spans are supported, as are `ungapped:trans` and `protein2genome:bestfit`. Target, query, and joint split-codon shadows are implemented in the generic executor. DNA `affine:local` uses k-mer seed/diagonal-cluster/exact-refine search by default. DNA genomic models (`est2genome`, `coding2genome`, `cdna2genome`, and `genome2genome`) use intron-aware padded target regions before unchanged exact DP. `protein2genome` and `protein2genome:bestfit` use translated amino-acid k-mers across all three frames of each requested target strand. `-E` selects exhaustive DP.
 
+For generic affine models, DNA versus protein input is inferred from FASTA unless
+`--querytype` or `--targettype` is supplied. The CLI follows upstream defaults:
+`--score 100` and enabled Waterman--Eggert `--subopt`; use `--score 0 --subopt no`
+when a single low-scoring local alignment is wanted. Long FASTA inputs can be
+partitioned on complete record boundaries with `--querychunkid` / `--querychunktotal`
+or `--targetchunkid` / `--targetchunktotal`.
+
 Clone with the upstream behavioural oracle used by the regression tests:
 
 ```bash
@@ -60,5 +67,7 @@ On the checked 3,000 x 5,000 nt planted-alignment fixture, the release build pro
 
 `-D` / `--dpmemory` takes a MiB planning budget. For affine models, `est2genome`, `protein2genome`, `coding2genome`, and `cdna2genome`, an exhaustive run switches to exact checkpointed traceback when the full matrix estimate exceeds that budget. The planner minimizes its estimated checkpoint footprint; if even one rolling DP row cannot fit (including `-D 0`), it still runs the minimum-footprint checkpoint plan. Exhaustive `genome2genome` likewise feeds the budget to its checkpoint-block planner, uses rolling score rows, and replays compact parent blocks; it currently rebuilds the required prefix for each block, trading additional CPU time for bounded parent memory. Thus `-D 0` is a deterministic low-memory-path selector, not a literal zero-byte or RSS hard cap.
 
-See [`exonerate.md`](exonerate.md) for the staged architecture and
-[`COMPATIBILITY.md`](COMPATIBILITY.md) for the implemented compatibility surface.
+See [`exonerate.md`](exonerate.md) for the staged architecture,
+[`COMPATIBILITY.md`](COMPATIBILITY.md) for the implemented compatibility
+surface, and [`ORACLE_MATRIX.md`](ORACLE_MATRIX.md) for the permanent upstream
+CLI regression inventory.

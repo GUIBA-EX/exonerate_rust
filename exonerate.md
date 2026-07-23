@@ -64,7 +64,7 @@ license = "GPL-3.0-only"
 
 - **`bio 4.x`**：alphabet、reverse complement、translation、q-gram、FM/FMD index、PSSM、简单 pairwise、sparse alignment。
 - **`noodles-fasta`**：流式 FASTA 和 FAI 索引；当前版本为 0.63.0。
-- **`noodles-gff`**：标准 GFF3 数据结构，但旧 Exonerate 的 GFF 输出仍应使用自定义 formatter 保证兼容。
+- **`noodles-gff`**：标准 GFF3 数据结构；旧 Exonerate 的 GFF2 输出不在当前兼容目标内。
 - **`clap`**：复刻原有大量长短选项。
 - **`rayon`**：query×target 或 query×database 粗粒度并行。
 - **`tracing`**：结构化诊断和性能阶段统计。

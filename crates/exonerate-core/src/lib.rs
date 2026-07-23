@@ -3042,7 +3042,7 @@ fn align_with_scorer_forbidden(
     };
     let (n, m, cols) = (query.bases.len(), t.len(), t.len() + 1);
     if model == Model::Ungapped {
-        return ungapped(query, target, &t, scoring, strand, scorer);
+        return ungapped(query, target, &t, scoring, strand, scorer, forbidden);
     }
     let gap_open = kernel_score(ir.transitions[2].kernel, b'A', b'A', scoring);
     let gap_extend = kernel_score(ir.transitions[4].kernel, b'A', b'A', scoring);
@@ -3337,12 +3337,21 @@ fn ungapped(
     scoring: Scoring,
     strand: Strand,
     scorer: fn(u8, u8, Scoring) -> Score,
+    forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
     let mut best = (0usize, 0usize, 0usize, 0usize, 0);
     for qi in 0..query.bases.len() {
         for tj in 0..t.len() {
             let (mut i, mut j, mut score, mut qstart, mut tstart) = (qi, tj, 0, qi, tj);
             while i < query.bases.len() && j < t.len() {
+                if forbidden.is_some_and(|pairs| pairs.contains(&(i, j))) {
+                    score = 0;
+                    qstart = i + 1;
+                    tstart = j + 1;
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
                 score += scorer(query.bases[i], t[j], scoring);
                 if score < 0 {
                     score = 0;
@@ -4783,6 +4792,7 @@ fn forbidden_split_codon_transition(
 fn align_suboptimal_pair(
     query: &Sequence,
     target: &Sequence,
+    model: Model,
     scoring: Scoring,
     threshold: Score,
 ) -> Vec<Alignment> {
@@ -4792,7 +4802,7 @@ fn align_suboptimal_pair(
         let alignment = align_with_scorer_forbidden(
             query,
             target,
-            Model::Local,
+            model,
             scoring,
             Strand::Forward,
             dna_score,
@@ -4825,15 +4835,63 @@ pub fn align_database_suboptimal(
     let mut out = Vec::new();
     for query in queries {
         for target in targets {
-            out.extend(align_suboptimal_pair(query, target, scoring, threshold));
+            out.extend(align_suboptimal_pair(
+                query,
+                target,
+                Model::Local,
+                scoring,
+                threshold,
+            ));
             if both_strands {
                 let reverse_query = Sequence {
                     id: query.id.clone(),
                     bases: reverse_complement(&query.bases),
                 };
                 for mut alignment in
-                    align_suboptimal_pair(&reverse_query, target, scoring, threshold)
+                    align_suboptimal_pair(&reverse_query, target, Model::Local, scoring, threshold)
                 {
+                    alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+                    alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                    alignment.query_strand = Strand::Reverse;
+                    out.push(alignment);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Pair-disjoint ungapped DNA HSPs, enumerated independently for each query
+/// orientation requested by the caller.
+pub fn align_ungapped_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_suboptimal_pair(
+                query,
+                target,
+                Model::Ungapped,
+                scoring,
+                threshold,
+            ));
+            if both_strands {
+                let reverse_query = Sequence {
+                    id: query.id.clone(),
+                    bases: reverse_complement(&query.bases),
+                };
+                for mut alignment in align_suboptimal_pair(
+                    &reverse_query,
+                    target,
+                    Model::Ungapped,
+                    scoring,
+                    threshold,
+                ) {
                     alignment.query_start = query.bases.len() as u64 - alignment.query_start;
                     alignment.query_end = query.bases.len() as u64 - alignment.query_end;
                     alignment.query_strand = Strand::Reverse;
@@ -4909,6 +4967,48 @@ pub fn align_protein_database_suboptimal(
     for query in queries {
         for target in targets {
             out.extend(align_protein_suboptimal(query, target, scoring, threshold));
+        }
+    }
+    out
+}
+
+/// Pair-disjoint ungapped protein HSPs.
+pub fn align_protein_ungapped_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            let mut forbidden = HashSet::new();
+            loop {
+                let mut alignment = align_with_scorer_forbidden(
+                    query,
+                    target,
+                    Model::Ungapped,
+                    scoring,
+                    Strand::Forward,
+                    protein_score,
+                    Some(&forbidden),
+                );
+                alignment.query_strand = Strand::Unknown;
+                alignment.target_strand = Strand::Unknown;
+                if alignment.score < threshold || alignment.score <= 0 {
+                    break;
+                }
+                let added = forbid_alignment_pairs(
+                    &alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                );
+                out.push(alignment);
+                if added == 0 {
+                    break;
+                }
+            }
         }
     }
     out
@@ -11434,10 +11534,33 @@ mod tests {
     }
 
     #[test]
+    fn split_codon_suboptimal_exclusion_checks_interior_pairs() {
+        let phase_one_interior = HashSet::from([(12, 31)]);
+        assert!(forbidden_split_codon_transition(
+            Some(&phase_one_interior),
+            10,
+            20,
+            1,
+            30,
+            2,
+        ));
+        let phase_two_interior = HashSet::from([(11, 21)]);
+        assert!(forbidden_split_codon_transition(
+            Some(&phase_two_interior),
+            10,
+            20,
+            2,
+            30,
+            1,
+        ));
+    }
+
+    #[test]
     fn suboptimal_local_paths_are_score_ordered_and_pair_disjoint() {
         let query = s("query", "ACGTACGTACGT");
         let target = s("target", "ACGTGGGGACGT");
-        let alignments = align_suboptimal_pair(&query, &target, Scoring::default(), 5);
+        let alignments =
+            align_suboptimal_pair(&query, &target, Model::Local, Scoring::default(), 5);
         assert!(alignments.len() >= 2);
         assert!(
             alignments

@@ -14,7 +14,8 @@ use exonerate_core::{
     align_protein_database_with_dp_memory, align_protein_to_dna_database,
     align_protein_to_dna_database_suboptimal, align_protein_to_genome_bestfit_database_heuristic,
     align_protein_to_genome_database_heuristic, align_protein_to_genome_database_suboptimal,
-    align_protein_to_genome_database_with_dp_memory, align_ungapped_translated_database,
+    align_protein_to_genome_database_with_dp_memory, align_protein_ungapped_database_suboptimal,
+    align_ungapped_database_suboptimal, align_ungapped_translated_database,
     align_ungapped_translated_database_suboptimal, dna_self_score, dna_substitution_score,
     protein_self_score, protein_substitution_score, read_fasta, reverse_complement, translate_dna,
     translated_self_score,
@@ -1044,10 +1045,6 @@ fn pretty_alignment(
             | "affine:bestfit:dna2dna"
             | "affine:local:dna2dna"
             | "affine:overlap:dna2dna"
-            | "affine:global:protein2protein"
-            | "affine:bestfit:protein2protein"
-            | "affine:local:protein2protein"
-            | "affine:overlap:protein2protein"
     );
     if !needs_model_line {
         return rendered;
@@ -1502,12 +1499,17 @@ fn run() -> Result<(), String> {
         || coding2genome
         || protein2genome
         || protein2genome_bestfit
-        || (query_type == "dna" && target_type == "dna" && model == Model::Local)
+        || (query_type == "dna"
+            && target_type == "dna"
+            && matches!(model, Model::Ungapped | Model::Local))
+        || (query_type == "protein"
+            && target_type == "protein"
+            && matches!(model, Model::Ungapped | Model::Local))
         || (query_type == "protein"
             && target_type == "dna"
-            && matches!(model, Model::Local | Model::BestFit));
+            && matches!(model, Model::Ungapped | Model::Local | Model::BestFit));
     let mut alignments = if suboptimal_supported && (subopt || best_n.is_some()) {
-        let plain_dna_local = !ungapped_translated
+        let plain_dna = !ungapped_translated
             && !ner
             && !coding2coding
             && !genome2genome
@@ -1518,7 +1520,7 @@ fn run() -> Result<(), String> {
             && !est2genome
             && query_type == "dna"
             && target_type == "dna"
-            && model == Model::Local;
+            && matches!(model, Model::Ungapped | Model::Local);
         let protein_dna = !ungapped_translated
             && !ner
             && !coding2coding
@@ -1530,8 +1532,8 @@ fn run() -> Result<(), String> {
             && !est2genome
             && query_type == "protein"
             && target_type == "dna"
-            && matches!(model, Model::Local | Model::BestFit);
-        let protein_affine_local = !ungapped_translated
+            && matches!(model, Model::Ungapped | Model::Local | Model::BestFit);
+        let protein_affine = !ungapped_translated
             && !ner
             && !coding2coding
             && !genome2genome
@@ -1542,7 +1544,7 @@ fn run() -> Result<(), String> {
             && !est2genome
             && query_type == "protein"
             && target_type == "protein"
-            && model == Model::Local;
+            && matches!(model, Model::Ungapped | Model::Local);
         if ungapped_translated {
             align_ungapped_translated_database_suboptimal(
                 &q,
@@ -1611,10 +1613,23 @@ fn run() -> Result<(), String> {
                 min_score.unwrap_or(100),
                 both,
             )
-        } else if protein_affine_local {
-            align_protein_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
-        } else if plain_dna_local {
-            align_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
+        } else if protein_affine {
+            if model == Model::Ungapped {
+                align_protein_ungapped_database_suboptimal(
+                    &q,
+                    &t,
+                    scoring,
+                    min_score.unwrap_or(100),
+                )
+            } else {
+                align_protein_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
+            }
+        } else if plain_dna {
+            if model == Model::Ungapped {
+                align_ungapped_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
+            } else {
+                align_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
+            }
         } else {
             return Err("suboptimal enumeration is not implemented for this model".into());
         }
