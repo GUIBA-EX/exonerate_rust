@@ -3,11 +3,20 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::mem::size_of;
 
 mod low_memory;
+use low_memory::{GenomeCheckpoint, GenomeScoreRow, genome_checkpoint_plan};
 pub use low_memory::{
-    align_database_with_dp_memory, align_low_memory, align_protein_database_with_dp_memory,
-    align_protein_low_memory, align_protein_with_dp_memory, align_with_dp_memory,
+    align_cdna_to_genome_database_with_dp_memory,
+    align_cdna_to_genome_database_with_dp_memory_stranded, align_cdna_to_genome_low_memory,
+    align_cdna_to_genome_with_dp_memory, align_coding_to_genome_database_with_dp_memory,
+    align_coding_to_genome_low_memory, align_coding_to_genome_with_dp_memory,
+    align_database_with_dp_memory, align_est2genome_database_with_dp_memory,
+    align_est2genome_low_memory, align_est2genome_with_dp_memory, align_low_memory,
+    align_protein_database_with_dp_memory, align_protein_low_memory,
+    align_protein_to_genome_database_with_dp_memory, align_protein_to_genome_low_memory,
+    align_protein_to_genome_with_dp_memory, align_protein_with_dp_memory, align_with_dp_memory,
 };
 
 /// Generic model graph, independent from a particular DP memory layout.
@@ -877,6 +886,16 @@ impl Default for IntronScoring {
     }
 }
 
+/// A spliced intron contains two-base donor and acceptor signals, so its
+/// canonical traceback cannot represent a span shorter than four bases.
+/// Upstream accepts smaller `--minintron` values but simply has no such
+/// traceback candidate; clamp the internal eligibility span to avoid unsigned
+/// underflow while preserving the caller's maximum length.
+fn canonical_intron_scoring(mut intron: IntronScoring) -> IntronScoring {
+    intron.min_len = intron.min_len.max(4);
+    intron
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Strand {
     Unknown,
@@ -1098,7 +1117,63 @@ impl Alignment {
         if body.is_empty() {
             self.sugar().replacen("sugar:", "cigar:", 1)
         } else {
-            format!("{}  {}", self.sugar().replacen("sugar:", "cigar:", 1), body)
+            // Upstream's implicit zero-length start operation leaves two
+            // spaces before a leading match, but only one before a leading
+            // gap in a global traceback.
+            let separator = if matches!(self.trace.first().map(|run| run.op), Some(Op::Match)) {
+                "  "
+            } else {
+                " "
+            };
+            format!(
+                "{}{}{}",
+                self.sugar().replacen("sugar:", "cigar:", 1),
+                separator,
+                body
+            )
+        }
+    }
+
+    /// CIGAR rendering for the composed cDNA-to-genome model.
+    ///
+    /// Upstream keeps a separate CIGAR `M` segment when a nucleotide match
+    /// meets a 3:3 coding match, even though both render as `M`.  This leaves
+    /// the generic CIGAR contract unchanged for the other models.
+    pub fn cdna_cigar(&self) -> String {
+        let mut ops: Vec<(char, u64, u32, u32)> = Vec::new();
+        for run in &self.trace {
+            let op = run.op.cigar(run.query_advance, run.target_advance);
+            let length = u64::from(run.query_advance.max(run.target_advance)) * run.repeats;
+            if let Some((last, count, query_advance, target_advance)) = ops.last_mut()
+                && *last == op
+                && (op != 'M'
+                    || (*query_advance == run.query_advance
+                        && *target_advance == run.target_advance))
+            {
+                *count += length;
+            } else {
+                ops.push((op, length, run.query_advance, run.target_advance));
+            }
+        }
+        let body = ops
+            .into_iter()
+            .map(|(op, count, _, _)| format!("{} {}", op, count))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if body.is_empty() {
+            self.sugar().replacen("sugar:", "cigar:", 1)
+        } else {
+            let separator = if matches!(self.trace.first().map(|run| run.op), Some(Op::Match)) {
+                "  "
+            } else {
+                " "
+            };
+            format!(
+                "{}{}{}",
+                self.sugar().replacen("sugar:", "cigar:", 1),
+                separator,
+                body
+            )
         }
     }
     /// Render a compact GFF3 match record plus contiguous aligned parts.
@@ -1540,6 +1615,11 @@ fn nucleic_index(base: u8) -> usize {
 fn dna_score(a: u8, b: u8, _scoring: Scoring) -> Score {
     nucleic_matrix::NUCLEIC[nucleic_index(a)][nucleic_index(b)]
 }
+/// Return the upstream nucleic substitution score used by RYO similarity
+/// reporting. Gap penalties are deliberately not part of this lookup.
+pub fn dna_substitution_score(a: u8, b: u8) -> Score {
+    dna_score(a, b, Scoring::default())
+}
 fn protein_index(base: u8) -> usize {
     match base.to_ascii_uppercase() {
         b'A' => 0,
@@ -1570,6 +1650,11 @@ fn protein_index(base: u8) -> usize {
 }
 fn protein_score(a: u8, b: u8, _scoring: Scoring) -> Score {
     blosum62_matrix::BLOSUM62[protein_index(a)][protein_index(b)]
+}
+/// Return the upstream BLOSUM62 substitution score used by RYO similarity
+/// reporting. Gap penalties are deliberately not part of this lookup.
+pub fn protein_substitution_score(a: u8, b: u8) -> Score {
+    protein_score(a, b, Scoring::default())
 }
 pub fn dna_self_score(sequence: &Sequence) -> Score {
     sequence
@@ -1677,7 +1762,7 @@ pub struct IntronCandidate {
 
 /// Bounded monotonic queue retaining the full predecessor identity needed by
 /// an intron traceback, rather than only its score.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct IntronCandidateWindow {
     entries: VecDeque<IntronCandidate>,
 }
@@ -1702,6 +1787,15 @@ impl IntronCandidateWindow {
     }
     pub fn best(&self) -> Option<IntronCandidate> {
         self.entries.front().copied()
+    }
+
+    /// Bytes needed to clone the live candidates into a checkpoint.
+    ///
+    /// `VecDeque::clone` only needs storage for live elements; spare ring
+    /// capacity is not semantic state and is deliberately excluded.
+    #[allow(dead_code)] // consumed when genome2genome checkpoint snapshots are wired in
+    fn checkpoint_bytes(&self) -> usize {
+        size_of::<Self>() + self.entries.len() * size_of::<IntronCandidate>()
     }
 }
 
@@ -1835,7 +1929,7 @@ fn ner_long_states(ir: &model::ModelIr) -> Vec<NerLongState> {
                 source: edge.from,
                 destination: edge.to,
                 transition: transition as u16,
-                min_len: min_len as usize,
+                min_len: (min_len as usize).max(4),
                 max_len: max_len as usize,
                 open,
             })
@@ -1932,7 +2026,7 @@ fn target_long_states(ir: &model::ModelIr) -> Vec<TargetLongState> {
                 open_transition: open_id as u16,
                 loop_transition: loop_id as u16,
                 close_transition: close_id as u16,
-                min_len: min_len as usize,
+                min_len: (min_len as usize).max(4),
                 max_len: max_len as usize,
                 donor,
                 acceptor,
@@ -1982,7 +2076,7 @@ fn joint_long_states(ir: &model::ModelIr) -> Vec<JointLongState> {
                 open_transition: open_id as u16,
                 loop_transition: loop_id as u16,
                 close_transition: close_id as u16,
-                min_len: min_len as usize,
+                min_len: (min_len as usize).max(4),
                 max_len: max_len as usize,
                 donor,
                 acceptor,
@@ -2724,7 +2818,15 @@ fn align_model_ir_with_intron_forbidden(
                                 edge.kernel,
                                 model::ScoreKernel::Phase | model::ScoreKernel::CodonSubstitution
                             ));
-                    if scores_pair && forbidden.is_some_and(|pairs| pairs.contains(&(i, j))) {
+                    if scores_pair
+                        && forbidden_match_transition(
+                            forbidden,
+                            i,
+                            j,
+                            edge.query_advance as usize,
+                            edge.target_advance as usize,
+                        )
+                    {
                         continue;
                     }
                     let is_partial_codon = matches!(edge.kernel, model::ScoreKernel::Phase)
@@ -2850,8 +2952,8 @@ fn align_model_ir_with_intron_forbidden(
     }
     let (target_start, target_end) = if strand == Strand::Reverse {
         (
-            target.bases.len() as u64 - oriented_target_end,
             target.bases.len() as u64 - j as u64,
+            target.bases.len() as u64 - oriented_target_end,
         )
     } else {
         (j as u64, oriented_target_end)
@@ -3348,6 +3450,7 @@ fn align_est2genome_one(
     strand: Strand,
     forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
+    let intron = canonical_intron_scoring(intron);
     let (n, m, cols) = (query.bases.len(), bases.len(), bases.len() + 1);
     let size = (n + 1) * (m + 1);
     let mut mm = vec![0; size];
@@ -4318,22 +4421,142 @@ pub fn align_genome_to_genome_database_heuristic(
     intron: IntronScoring,
     config: HeuristicConfig,
 ) -> Vec<Alignment> {
+    align_genome_to_genome_database_heuristic_with_rolling_scores(
+        queries, targets, scoring, intron, config, false,
+    )
+}
+
+fn align_genome_to_genome_database_heuristic_with_rolling_scores(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    config: HeuristicConfig,
+    rolling_scores: bool,
+) -> Vec<Alignment> {
     let mut out = Vec::new();
     for query in queries {
         for target in targets {
             let Some((target_start, target_end)) =
                 spliced_target_region(&query.bases, &target.bases, config, intron.max_len as usize)
             else {
-                out.push(align_genome_to_genome(query, target, scoring, intron));
+                out.push(align_genome_to_genome_memory_aware(
+                    query,
+                    target,
+                    scoring,
+                    intron,
+                    rolling_scores,
+                    None,
+                ));
                 continue;
             };
             let target_slice = Sequence {
                 id: target.id.clone(),
                 bases: target.bases[target_start..target_end].to_vec(),
             };
-            let mut alignment = align_genome_to_genome(query, &target_slice, scoring, intron);
+            let mut alignment = align_genome_to_genome_memory_aware(
+                query,
+                &target_slice,
+                scoring,
+                intron,
+                rolling_scores,
+                None,
+            );
             remap_target_slice(&mut alignment, target_start, target.bases.len());
             out.push(alignment);
+        }
+    }
+    out
+}
+
+/// Heuristic genome-to-genome search over the same four orientation pairs as
+/// exhaustive search.  Each oriented pair keeps its own seed refinement.
+pub fn align_genome_to_genome_database_heuristic_stranded(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    both_strands: bool,
+    config: HeuristicConfig,
+) -> Vec<Alignment> {
+    align_genome_to_genome_database_heuristic_stranded_with_rolling_scores(
+        queries,
+        targets,
+        scoring,
+        intron,
+        both_strands,
+        config,
+        false,
+    )
+}
+
+/// Genome-to-genome heuristic search with rolling score rows.  This is used
+/// by the CLI's forced low-memory mode while checkpoint parent replay is being
+/// completed.
+pub fn align_genome_to_genome_database_heuristic_stranded_with_rolling_scores(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    both_strands: bool,
+    config: HeuristicConfig,
+    rolling_scores: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(
+                align_genome_to_genome_database_heuristic_with_rolling_scores(
+                    std::slice::from_ref(query),
+                    std::slice::from_ref(target),
+                    scoring,
+                    intron,
+                    config,
+                    rolling_scores,
+                ),
+            );
+            if !both_strands {
+                continue;
+            }
+            let reverse_query = Sequence {
+                id: query.id.clone(),
+                bases: reverse_complement(&query.bases),
+            };
+            let reverse_target = Sequence {
+                id: target.id.clone(),
+                bases: reverse_complement(&target.bases),
+            };
+            for (oriented_query, query_reverse) in [(query, false), (&reverse_query, true)] {
+                for (oriented_target, target_reverse) in [(target, false), (&reverse_target, true)]
+                {
+                    if !query_reverse && !target_reverse {
+                        continue;
+                    }
+                    let mut alignment =
+                        align_genome_to_genome_database_heuristic_with_rolling_scores(
+                            std::slice::from_ref(oriented_query),
+                            std::slice::from_ref(oriented_target),
+                            scoring,
+                            intron,
+                            config,
+                            rolling_scores,
+                        )
+                        .pop()
+                        .expect("one oriented genome pair produces one alignment");
+                    alignment.target_id = target.id.clone();
+                    if target_reverse {
+                        alignment.target_start = target.bases.len() as u64 - alignment.target_start;
+                        alignment.target_end = target.bases.len() as u64 - alignment.target_end;
+                        alignment.target_strand = Strand::Reverse;
+                    }
+                    if query_reverse {
+                        alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+                        alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                        alignment.query_strand = Strand::Reverse;
+                    }
+                    out.push(alignment);
+                }
+            }
         }
     }
     out
@@ -4484,13 +4707,77 @@ fn forbid_alignment_pairs(
             if run.op == Op::Match
                 || (run.op == Op::SplitCodon && run.query_advance > 0 && run.target_advance > 0)
             {
-                forbidden.insert((query_position, target_position));
+                let mut divisor = run.query_advance.min(run.target_advance) as usize;
+                let mut remainder = run.query_advance.max(run.target_advance) as usize;
+                while divisor > 0 {
+                    let next = remainder % divisor;
+                    remainder = divisor;
+                    divisor = next;
+                }
+                let steps = remainder.max(1);
+                let query_step = run.query_advance as usize / steps;
+                let target_step = run.target_advance as usize / steps;
+                for step in 0..steps {
+                    forbidden.insert((
+                        query_position + step * query_step,
+                        target_position + step * target_step,
+                    ));
+                }
             }
             query_position += run.query_advance as usize;
             target_position += run.target_advance as usize;
         }
     }
     forbidden.len() - before
+}
+
+fn forbidden_match_transition(
+    forbidden: Option<&HashSet<(usize, usize)>>,
+    query_start: usize,
+    target_start: usize,
+    query_advance: usize,
+    target_advance: usize,
+) -> bool {
+    let Some(forbidden) = forbidden else {
+        return false;
+    };
+    if query_advance == 0 || target_advance == 0 {
+        return false;
+    }
+    let mut divisor = query_advance.min(target_advance);
+    let mut remainder = query_advance.max(target_advance);
+    while divisor > 0 {
+        let next = remainder % divisor;
+        remainder = divisor;
+        divisor = next;
+    }
+    let steps = remainder.max(1);
+    let query_step = query_advance / steps;
+    let target_step = target_advance / steps;
+    (0..steps).any(|step| {
+        forbidden.contains(&(
+            query_start + step * query_step,
+            target_start + step * target_step,
+        ))
+    })
+}
+
+fn forbidden_split_codon_transition(
+    forbidden: Option<&HashSet<(usize, usize)>>,
+    query_start: usize,
+    pre_target_start: usize,
+    pre_len: usize,
+    post_target_start: usize,
+    post_len: usize,
+) -> bool {
+    let Some(forbidden) = forbidden else {
+        return false;
+    };
+    (0..pre_len)
+        .any(|offset| forbidden.contains(&(query_start + offset, pre_target_start + offset)))
+        || (0..post_len).any(|offset| {
+            forbidden.contains(&(query_start + pre_len + offset, post_target_start + offset))
+        })
 }
 
 fn align_suboptimal_pair(
@@ -4568,6 +4855,60 @@ pub fn align_protein_database(
     for query in queries {
         for target in targets {
             out.push(align_protein(query, target, model, scoring));
+        }
+    }
+    out
+}
+
+/// Waterman--Eggert local protein alignments using the same pair exclusion
+/// rule as DNA affine alignment.
+pub fn align_protein_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    let mut forbidden = HashSet::new();
+    let mut out = Vec::new();
+    loop {
+        let mut alignment = align_with_scorer_forbidden(
+            query,
+            target,
+            Model::Local,
+            scoring,
+            Strand::Forward,
+            protein_score,
+            Some(&forbidden),
+        );
+        alignment.query_strand = Strand::Unknown;
+        alignment.target_strand = Strand::Unknown;
+        if alignment.score < threshold || alignment.score <= 0 {
+            break;
+        }
+        let added = forbid_alignment_pairs(
+            &alignment,
+            query.bases.len(),
+            target.bases.len(),
+            &mut forbidden,
+        );
+        out.push(alignment);
+        if added == 0 {
+            break;
+        }
+    }
+    out
+}
+
+pub fn align_protein_database_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_protein_suboptimal(query, target, scoring, threshold));
         }
     }
     out
@@ -4682,7 +5023,7 @@ fn align_coding2coding_forbidden(
                     }
                 }
             }
-            if i >= 3 && j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
+            if i >= 3 && j >= 3 && !forbidden_match_transition(forbidden, i - 3, j - 3, 3, 3) {
                 let p = idx(i - 3, j - 3, cols);
                 let (value, state) =
                     best(&[(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]);
@@ -4955,7 +5296,7 @@ fn cdna_relax(
     state: CdnaState,
     fragment: TraceFragment,
 ) {
-    if candidate > *score {
+    if candidate > *score || (candidate == *score && fragment.atoms.iter().any(Option::is_some)) {
         *score = candidate;
         *parent = Some(CdnaParent { state, fragment });
     }
@@ -5024,6 +5365,7 @@ fn cdna2genome_dp(
     intron: IntronScoring,
     forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> CdnaDp {
+    let intron = canonical_intron_scoring(intron);
     let (n, m, cols) = (
         query.bases.len(),
         target.bases.len(),
@@ -5251,10 +5593,14 @@ fn cdna2genome_dp(
                                 ),
                             ) {
                                 let pre = c.start - phase;
-                                if forbidden.is_some_and(|pairs| {
-                                    pairs.contains(&(i - 3, pre))
-                                        || pairs.contains(&(i - post, post_start))
-                                }) {
+                                if forbidden_split_codon_transition(
+                                    forbidden,
+                                    i - 3,
+                                    pre,
+                                    phase,
+                                    post_start,
+                                    post,
+                                ) {
                                     continue;
                                 }
                                 let mut codon = Vec::with_capacity(3);
@@ -5395,7 +5741,7 @@ fn cdna2genome_dp(
                         repeats: 1,
                     }),
                 );
-                if j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
+                if j >= 3 && !forbidden_match_transition(forbidden, i - 3, j - 3, 3, 3) {
                     let p = idx(i - 3, j - 3, cols);
                     let (v, st) = best(&[(cm[p], State::M), (ci[p], State::I), (cd[p], State::D)]);
                     cdna_relax(
@@ -5631,7 +5977,7 @@ fn cdna2genome_dp(
                 (ci[k], CdnaState::CodingI),
                 (cd[k], CdnaState::CodingD),
             ] {
-                if (value, i, j) > (end.3, end.0, end.1) {
+                if value > end.3 {
                     end = (i, j, state, value);
                 }
             }
@@ -6008,6 +6354,256 @@ enum GenomeState {
     CdsM,
     CdsI,
     CdsD,
+    U3M,
+    U3I,
+    U3D,
+}
+
+/// Score storage used by the genome-to-genome recurrence.  The full solver
+/// keeps every row for now; checkpointed execution uses only the predecessor
+/// history required by phase introns and frameshifts while retaining the same
+/// indexed recurrence below.
+enum GenomeScoreMatrix {
+    Full {
+        cols: usize,
+        scores: Vec<Score>,
+    },
+    Rolling {
+        cols: usize,
+        rows: Vec<Vec<Score>>,
+        row_numbers: Vec<usize>,
+    },
+}
+
+impl GenomeScoreMatrix {
+    fn full(cols: usize, size: usize, initial: Score) -> Self {
+        Self::Full {
+            cols,
+            scores: vec![initial; size],
+        }
+    }
+
+    fn rolling(cols: usize, history_rows: usize) -> Self {
+        Self::Rolling {
+            cols,
+            rows: (0..history_rows.max(1))
+                .map(|_| vec![NEG_INF; cols])
+                .collect(),
+            row_numbers: vec![usize::MAX; history_rows.max(1)],
+        }
+    }
+
+    fn start_row(&mut self, row: usize, initial: Score) {
+        let Self::Rolling {
+            rows, row_numbers, ..
+        } = self
+        else {
+            return;
+        };
+        let slot = row % rows.len();
+        rows[slot].fill(initial);
+        row_numbers[slot] = row;
+    }
+
+    fn slot(&self, index: usize) -> (usize, usize) {
+        match self {
+            Self::Full { .. } => unreachable!("full score matrices index directly"),
+            Self::Rolling {
+                cols,
+                rows,
+                row_numbers,
+            } => {
+                let row = index / *cols;
+                let column = index % *cols;
+                let slot = row % rows.len();
+                assert_eq!(
+                    row_numbers[slot], row,
+                    "genome checkpoint history omitted required row {row}"
+                );
+                (slot, column)
+            }
+        }
+    }
+
+    fn row_clone(&self, row: usize) -> Vec<Score> {
+        match self {
+            Self::Full { cols, scores } => scores[row * *cols..(row + 1) * *cols].to_vec(),
+            Self::Rolling {
+                rows, row_numbers, ..
+            } => {
+                let slot = row % rows.len();
+                assert_eq!(row_numbers[slot], row);
+                rows[slot].clone()
+            }
+        }
+    }
+
+    #[allow(dead_code)] // consumed by genome2genome checkpoint block replay
+    fn restore_row(&mut self, row: usize, values: &[Score]) {
+        match self {
+            Self::Full { cols, scores } => {
+                assert_eq!(values.len(), *cols);
+                scores[row * *cols..(row + 1) * *cols].copy_from_slice(values);
+            }
+            Self::Rolling {
+                cols,
+                rows,
+                row_numbers,
+            } => {
+                assert_eq!(values.len(), *cols);
+                let slot = row % rows.len();
+                rows[slot].copy_from_slice(values);
+                row_numbers[slot] = row;
+            }
+        }
+    }
+}
+
+impl std::ops::Index<usize> for GenomeScoreMatrix {
+    type Output = Score;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match self {
+            Self::Full { scores, .. } => &scores[index],
+            Self::Rolling { rows, .. } => {
+                let (slot, column) = self.slot(index);
+                &rows[slot][column]
+            }
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for GenomeScoreMatrix {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        match self {
+            Self::Full { scores, .. } => &mut scores[index],
+            Self::Rolling {
+                cols,
+                rows,
+                row_numbers,
+            } => {
+                let row = index / *cols;
+                let column = index % *cols;
+                let slot = row % rows.len();
+                assert_eq!(
+                    row_numbers[slot], row,
+                    "genome checkpoint history omitted required row {row}"
+                );
+                &mut rows[slot][column]
+            }
+        }
+    }
+}
+
+/// Parent-pointer storage for genome-to-genome traceback.  Checkpoint block
+/// reconstruction writes only its active rows; updates outside that block are
+/// routed to a scratch slot because their scores remain available in the
+/// checkpoint history.
+enum GenomeParentMatrix {
+    Full(Vec<Option<GenomeParent>>),
+    Block {
+        cols: usize,
+        first_row: usize,
+        last_row: usize,
+        parents: Vec<Option<GenomeParent>>,
+        empty: Option<GenomeParent>,
+        discarded: Option<GenomeParent>,
+    },
+}
+
+impl GenomeParentMatrix {
+    fn full(size: usize) -> Self {
+        Self::Full(vec![None; size])
+    }
+
+    #[allow(dead_code)] // consumed by genome2genome block reconstruction
+    fn block(cols: usize, first_row: usize, last_row: usize) -> Self {
+        Self::Block {
+            cols,
+            first_row,
+            last_row,
+            parents: vec![None; (last_row - first_row + 1) * cols],
+            empty: None,
+            discarded: None,
+        }
+    }
+
+    fn block_index(&self, index: usize) -> Option<usize> {
+        let Self::Block {
+            cols,
+            first_row,
+            last_row,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        let row = index / *cols;
+        if row >= *first_row && row <= *last_row {
+            Some((row - *first_row) * *cols + index % *cols)
+        } else {
+            None
+        }
+    }
+}
+
+impl std::ops::Index<usize> for GenomeParentMatrix {
+    type Output = Option<GenomeParent>;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        match self {
+            Self::Full(parents) => &parents[index],
+            Self::Block { parents, empty, .. } => self
+                .block_index(index)
+                .map(|offset| &parents[offset])
+                .unwrap_or(empty),
+        }
+    }
+}
+
+impl std::ops::IndexMut<usize> for GenomeParentMatrix {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        let offset = self.block_index(index);
+        match self {
+            Self::Full(parents) => &mut parents[index],
+            Self::Block {
+                parents, discarded, ..
+            } => offset
+                .map(|offset| &mut parents[offset])
+                .unwrap_or(discarded),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments, dead_code)] // consumed by block replay
+fn restore_genome_checkpoint_scores(
+    checkpoint: &GenomeCheckpoint,
+    u5m: &mut GenomeScoreMatrix,
+    u5i: &mut GenomeScoreMatrix,
+    u5d: &mut GenomeScoreMatrix,
+    cm: &mut GenomeScoreMatrix,
+    ci: &mut GenomeScoreMatrix,
+    cd: &mut GenomeScoreMatrix,
+    u3m: &mut GenomeScoreMatrix,
+    u3i: &mut GenomeScoreMatrix,
+    u3d: &mut GenomeScoreMatrix,
+) {
+    for row in &checkpoint.history {
+        u5m.restore_row(row.row, &row.u5m);
+        u5i.restore_row(row.row, &row.u5i);
+        u5d.restore_row(row.row, &row.u5d);
+        cm.restore_row(row.row, &row.cm);
+        ci.restore_row(row.row, &row.ci);
+        cd.restore_row(row.row, &row.cd);
+        u3m.restore_row(row.row, &row.u3m);
+        u3i.restore_row(row.row, &row.u3i);
+        u3d.restore_row(row.row, &row.u3d);
+    }
+}
+
+#[allow(dead_code)] // consumed by genome2genome checkpoint block replay
+fn restore_genome_checkpoint_queues(checkpoint: &GenomeCheckpoint) -> GenomeIntronQueues {
+    checkpoint.queues.clone()
 }
 impl From<State> for GenomeState {
     fn from(value: State) -> Self {
@@ -6023,7 +6619,68 @@ impl From<State> for GenomeState {
 #[derive(Clone, Copy)]
 struct GenomeParent {
     state: GenomeState,
-    fragment: TraceFragment,
+    fragment: CompactGenomeFragment,
+}
+
+/// A genome-to-genome parent never needs the `repeats` field: every atomic
+/// transition is materialized individually by the recurrence.  Keeping the
+/// five atoms in this packed form halves the resident parent-matrix payload
+/// while preserving enough information to recreate the public trace exactly.
+#[derive(Clone, Copy)]
+struct CompactGenomeRun {
+    transition_id: u16,
+    op: Op,
+    query_advance: u32,
+    target_advance: u32,
+}
+
+#[derive(Clone, Copy)]
+struct CompactGenomeFragment {
+    atoms: [Option<CompactGenomeRun>; 5],
+}
+
+impl CompactGenomeFragment {
+    fn from_trace_fragment(fragment: TraceFragment) -> Self {
+        Self {
+            atoms: fragment.atoms.map(|atom| {
+                atom.map(|run| {
+                    debug_assert_eq!(run.repeats, 1);
+                    CompactGenomeRun {
+                        transition_id: run.transition_id,
+                        op: run.op,
+                        query_advance: run.query_advance,
+                        target_advance: run.target_advance,
+                    }
+                })
+            }),
+        }
+    }
+
+    fn expand(self) -> TraceFragment {
+        TraceFragment {
+            atoms: self.atoms.map(|atom| {
+                atom.map(|run| TraceRun {
+                    transition_id: run.transition_id,
+                    op: run.op,
+                    query_advance: run.query_advance,
+                    target_advance: run.target_advance,
+                    repeats: 1,
+                })
+            }),
+        }
+    }
+
+    fn advances(self) -> (usize, usize) {
+        self.atoms
+            .into_iter()
+            .flatten()
+            .fold((0, 0), |(q, t), run| {
+                (
+                    q + run.query_advance as usize,
+                    t + run.target_advance as usize,
+                )
+            })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6034,7 +6691,7 @@ struct JointIntronCandidate {
     state_rank: u8,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct JointIntronWindow {
     entries: VecDeque<JointIntronCandidate>,
 }
@@ -6060,6 +6717,117 @@ impl JointIntronWindow {
     fn best(&self) -> Option<JointIntronCandidate> {
         self.entries.front().copied()
     }
+
+    #[allow(dead_code)] // consumed when genome2genome checkpoint snapshots are wired in
+    fn checkpoint_bytes(&self) -> usize {
+        size_of::<Self>() + self.entries.len() * size_of::<JointIntronCandidate>()
+    }
+}
+
+/// All cross-query-row intron candidates needed by `genome2genome`.
+///
+/// Keeping these together makes a checkpoint self-contained: score rows alone
+/// are insufficient because query and joint introns retain monotonic candidate
+/// queues for every target column and coding phase.
+#[derive(Clone)]
+struct GenomeIntronQueues {
+    query: Vec<IntronCandidateWindow>,
+    joint: Vec<JointIntronWindow>,
+    u3_query: Vec<IntronCandidateWindow>,
+    u3_joint: Vec<JointIntronWindow>,
+    query_coding: [Vec<IntronCandidateWindow>; 3],
+    joint_coding: [Vec<JointIntronWindow>; 3],
+}
+
+impl GenomeIntronQueues {
+    fn new(columns: usize) -> Self {
+        Self {
+            query: (0..columns)
+                .map(|_| IntronCandidateWindow::default())
+                .collect(),
+            joint: (0..columns).map(|_| JointIntronWindow::default()).collect(),
+            u3_query: (0..columns)
+                .map(|_| IntronCandidateWindow::default())
+                .collect(),
+            u3_joint: (0..columns).map(|_| JointIntronWindow::default()).collect(),
+            query_coding: std::array::from_fn(|_| {
+                (0..columns)
+                    .map(|_| IntronCandidateWindow::default())
+                    .collect()
+            }),
+            joint_coding: std::array::from_fn(|_| {
+                (0..columns).map(|_| JointIntronWindow::default()).collect()
+            }),
+        }
+    }
+
+    /// Exact payload size of the queue state that a genome2genome checkpoint
+    /// must preserve.  Candidate deques span arbitrarily many query rows, so
+    /// treating this as a fixed number of score rows would under-estimate
+    /// checkpoint memory and make an exact reconstruction impossible.
+    #[allow(dead_code)] // consumed when genome2genome checkpoint snapshots are wired in
+    fn checkpoint_bytes(&self) -> usize {
+        self.query
+            .iter()
+            .map(IntronCandidateWindow::checkpoint_bytes)
+            .chain(
+                self.query_coding
+                    .iter()
+                    .flatten()
+                    .map(IntronCandidateWindow::checkpoint_bytes),
+            )
+            .chain(
+                self.u3_query
+                    .iter()
+                    .map(IntronCandidateWindow::checkpoint_bytes),
+            )
+            .chain(self.joint.iter().map(JointIntronWindow::checkpoint_bytes))
+            .chain(
+                self.u3_joint
+                    .iter()
+                    .map(JointIntronWindow::checkpoint_bytes),
+            )
+            .chain(
+                self.joint_coding
+                    .iter()
+                    .flatten()
+                    .map(JointIntronWindow::checkpoint_bytes),
+            )
+            .sum()
+    }
+}
+
+/// Number of full score rows retained by a genome2genome checkpoint.
+///
+/// Phase-aware query and joint intron candidates read as far back as
+/// `min_intron + 3` rows; keeping the source row as well makes that
+/// `min_intron + 4`.  The four/five-base frameshift edges independently need
+/// six rows.  This must remain dynamic rather than adopting the five-row
+/// coding2genome history.
+fn genome_checkpoint_history_rows(intron: IntronScoring) -> usize {
+    (intron.min_len as usize + 4).max(6)
+}
+
+/// Conservative payload bound for the cross-row intron queues at one
+/// `genome2genome` checkpoint.
+///
+/// Every family retains candidates whose donor coordinate lies in the
+/// inclusive `min_len..=max_len` intron window.  There are five
+/// single-coordinate families (two UTRs plus three coding phases) and five
+/// joint-coordinate families, each for every target column.  The bound is
+/// intentionally expressed in live candidate payload rather than deque
+/// capacity: cloned checkpoints allocate only semantic entries.
+#[allow(dead_code)] // consumed when genome2genome checkpoint planning is wired in
+fn genome_checkpoint_queue_upper_bound_bytes(columns: usize, intron: IntronScoring) -> u128 {
+    let span = (intron.max_len as usize)
+        .saturating_sub(intron.min_len as usize)
+        .saturating_add(1) as u128;
+    let columns = columns as u128;
+    let single =
+        size_of::<IntronCandidateWindow>() as u128 + span * size_of::<IntronCandidate>() as u128;
+    let joint =
+        size_of::<JointIntronWindow>() as u128 + span * size_of::<JointIntronCandidate>() as u128;
+    columns * 5 * (single + joint)
 }
 
 fn genome_relax<S: Into<GenomeState>>(
@@ -6069,11 +6837,14 @@ fn genome_relax<S: Into<GenomeState>>(
     state: S,
     fragment: TraceFragment,
 ) {
-    if candidate > *score {
+    // Equal-scoring consuming edges replace a prior edge, matching C4's
+    // transition-order tie resolution while preserving an existing path over
+    // a later epsilon edge.
+    if candidate > *score || (candidate == *score && fragment.atoms.iter().any(Option::is_some)) {
         *score = candidate;
         *parent = Some(GenomeParent {
             state: state.into(),
-            fragment,
+            fragment: CompactGenomeFragment::from_trace_fragment(fragment),
         });
     }
 }
@@ -6101,6 +6872,7 @@ fn genome_raw_fragment(
     let target_start = target_end - target_advance;
     let atoms = parent
         .fragment
+        .expand()
         .atoms
         .into_iter()
         .flatten()
@@ -6360,7 +7132,58 @@ fn genome_raw_fragment(
     raw
 }
 
-#[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
+fn genome_traceback_fragments(
+    mut i: usize,
+    mut j: usize,
+    mut state: GenomeState,
+    cols: usize,
+    pmat: &GenomeParentMatrix,
+    pins: &GenomeParentMatrix,
+    pdel: &GenomeParentMatrix,
+    pcm: &GenomeParentMatrix,
+    pci: &GenomeParentMatrix,
+    pcd: &GenomeParentMatrix,
+    pu3m: &GenomeParentMatrix,
+    pu3i: &GenomeParentMatrix,
+    pu3d: &GenomeParentMatrix,
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+) -> (
+    usize,
+    usize,
+    GenomeState,
+    Vec<(TraceFragment, Vec<RawStep>)>,
+) {
+    let mut fragments = Vec::new();
+    loop {
+        let parent = match state {
+            GenomeState::UtrM => pmat[idx(i, j, cols)],
+            GenomeState::UtrI => pins[idx(i, j, cols)],
+            GenomeState::UtrD => pdel[idx(i, j, cols)],
+            GenomeState::CdsM => pcm[idx(i, j, cols)],
+            GenomeState::CdsI => pci[idx(i, j, cols)],
+            GenomeState::CdsD => pcd[idx(i, j, cols)],
+            GenomeState::U3M => pu3m[idx(i, j, cols)],
+            GenomeState::U3I => pu3i[idx(i, j, cols)],
+            GenomeState::U3D => pu3d[idx(i, j, cols)],
+        };
+        let Some(parent) = parent else { break };
+        let raw_fragment = genome_raw_fragment(parent, state, i, j, query, target, scoring, intron);
+        let (qa, ta) = parent.fragment.advances();
+        debug_assert!(i >= qa && j >= ta);
+        i -= qa;
+        j -= ta;
+        fragments.push((parent.fragment.expand(), raw_fragment));
+        state = parent.state;
+    }
+    fragments.reverse();
+    (i, j, state, fragments)
+}
+
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 /// Local genome-to-genome Viterbi with affine DNA gaps plus query-only,
 /// target-only, and synchronised (joint) introns.  A joint intron has one
 /// opening penalty and splice scores on both sequences, exactly as upstream
@@ -6371,38 +7194,97 @@ fn align_genome_to_genome_forbidden(
     scoring: Scoring,
     intron: IntronScoring,
     forbidden: Option<&HashSet<(usize, usize)>>,
+    rolling_scores: bool,
+    parent_rows: Option<(usize, usize)>,
+    forced_end: Option<(usize, usize, GenomeState)>,
+    traceback_start_sink: Option<&mut (usize, usize, GenomeState)>,
+    mut checkpoint_sink: Option<&mut Vec<GenomeCheckpoint>>,
+    checkpoint_stride: usize,
 ) -> Alignment {
+    let intron = canonical_intron_scoring(intron);
     let (n, m, cols) = (
         query.bases.len(),
         target.bases.len(),
         target.bases.len() + 1,
     );
     let size = (n + 1) * (m + 1);
-    let mut mat = vec![0; size];
-    let mut ins = vec![NEG_INF; size];
-    let mut del = vec![NEG_INF; size];
-    let mut pmat: Vec<Option<GenomeParent>> = vec![None; size];
-    let mut pins: Vec<Option<GenomeParent>> = vec![None; size];
-    let mut pdel: Vec<Option<GenomeParent>> = vec![None; size];
-    let mut cm = vec![NEG_INF; size];
-    let mut ci = vec![NEG_INF; size];
-    let mut cd = vec![NEG_INF; size];
-    let mut pcm: Vec<Option<GenomeParent>> = vec![None; size];
-    let mut pci: Vec<Option<GenomeParent>> = vec![None; size];
-    let mut pcd: Vec<Option<GenomeParent>> = vec![None; size];
-    let mut query_windows: Vec<IntronCandidateWindow> =
-        (0..=m).map(|_| IntronCandidateWindow::default()).collect();
-    let mut joint_columns: Vec<JointIntronWindow> =
-        (0..=m).map(|_| JointIntronWindow::default()).collect();
-    let mut query_coding_windows: [Vec<IntronCandidateWindow>; 3] =
-        std::array::from_fn(|_| (0..=m).map(|_| IntronCandidateWindow::default()).collect());
-    let mut joint_coding_columns: [Vec<JointIntronWindow>; 3] =
-        std::array::from_fn(|_| (0..=m).map(|_| JointIntronWindow::default()).collect());
+    let mut mat = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, 0)
+    };
+    let mut ins = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut del = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let parent_matrix = || match parent_rows {
+        Some((first_row, last_row)) => GenomeParentMatrix::block(cols, first_row, last_row),
+        None => GenomeParentMatrix::full(size),
+    };
+    let mut pmat = parent_matrix();
+    let mut pins = parent_matrix();
+    let mut pdel = parent_matrix();
+    let mut cm = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut ci = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut cd = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut pcm = parent_matrix();
+    let mut pci = parent_matrix();
+    let mut pcd = parent_matrix();
+    // `genome2genome` composes the pre- and post-CDS UTR graphs separately.
+    // Keeping the post-CDS states distinct prevents an epsilon CDS exit from
+    // re-entering the coding graph, which would create paths absent upstream.
+    let mut u3m = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut u3i = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut u3d = if rolling_scores {
+        GenomeScoreMatrix::rolling(cols, genome_checkpoint_history_rows(intron))
+    } else {
+        GenomeScoreMatrix::full(cols, size, NEG_INF)
+    };
+    let mut pu3m = parent_matrix();
+    let mut pu3i = parent_matrix();
+    let mut pu3d = parent_matrix();
+    let mut queues = GenomeIntronQueues::new(m + 1);
     let mut end = (0usize, 0usize, GenomeState::UtrM, 0);
     let min_len = intron.min_len as usize;
     let max_len = intron.max_len as usize;
+    debug_assert!(genome_checkpoint_history_rows(intron) > min_len + 3);
 
     for i in 0..=n {
+        mat.start_row(i, 0);
+        ins.start_row(i, NEG_INF);
+        del.start_row(i, NEG_INF);
+        cm.start_row(i, NEG_INF);
+        ci.start_row(i, NEG_INF);
+        cd.start_row(i, NEG_INF);
+        u3m.start_row(i, NEG_INF);
+        u3i.start_row(i, NEG_INF);
+        u3d.start_row(i, NEG_INF);
         // Make query-side and joint-intron starts eligible once their minimum
         // query span has been reached.  Their source row is fully resolved.
         if i >= min_len {
@@ -6421,7 +7303,7 @@ fn align_genome_to_genome_forbidden(
                         SpliceType::DonorForward,
                         intron.force_gtag,
                     ) {
-                        query_windows[j].insert(IntronCandidate {
+                        queues.query[j].insert(IntronCandidate {
                             start: source_i,
                             score: add(value, intron.open_penalty.saturating_add(donor)),
                             state_rank: state.rank(),
@@ -6432,7 +7314,7 @@ fn align_genome_to_genome_forbidden(
                             SpliceType::DonorForward,
                             intron.force_gtag,
                         ) {
-                            joint_columns[j].insert(JointIntronCandidate {
+                            queues.joint[j].insert(JointIntronCandidate {
                                 query_start: source_i,
                                 target_start: j,
                                 score: add(
@@ -6448,8 +7330,50 @@ fn align_genome_to_genome_forbidden(
                     }
                 }
                 if i > max_len {
-                    query_windows[j].expire_before(i - max_len);
-                    joint_columns[j].expire_before(i - max_len);
+                    queues.query[j].expire_before(i - max_len);
+                    queues.joint[j].expire_before(i - max_len);
+                }
+                let (value, state) = best(&[
+                    (u3m[source], State::M),
+                    (u3i[source], State::I),
+                    (u3d[source], State::D),
+                ]);
+                if value > 0 {
+                    if let Some(donor) = splice_score(
+                        &query.bases,
+                        source_i,
+                        SpliceType::DonorForward,
+                        intron.force_gtag,
+                    ) {
+                        queues.u3_query[j].insert(IntronCandidate {
+                            start: source_i,
+                            score: add(value, intron.open_penalty.saturating_add(donor)),
+                            state_rank: state.rank(),
+                        });
+                        if let Some(target_donor) = splice_score(
+                            &target.bases,
+                            j,
+                            SpliceType::DonorForward,
+                            intron.force_gtag,
+                        ) {
+                            queues.u3_joint[j].insert(JointIntronCandidate {
+                                query_start: source_i,
+                                target_start: j,
+                                score: add(
+                                    value,
+                                    intron
+                                        .open_penalty
+                                        .saturating_add(donor)
+                                        .saturating_add(target_donor),
+                                ),
+                                state_rank: state.rank(),
+                            });
+                        }
+                    }
+                }
+                if i > max_len {
+                    queues.u3_query[j].expire_before(i - max_len);
+                    queues.u3_joint[j].expire_before(i - max_len);
                 }
             }
         }
@@ -6482,7 +7406,7 @@ fn align_genome_to_genome_forbidden(
                                 SpliceType::DonorForward,
                                 intron.force_gtag,
                             ) {
-                                joint_coding_columns[phase][target_donor].insert(
+                                queues.joint_coding[phase][target_donor].insert(
                                     JointIntronCandidate {
                                         query_start: donor,
                                         target_start: target_donor,
@@ -6504,7 +7428,7 @@ fn align_genome_to_genome_forbidden(
             if i >= min_len + 3 {
                 let post_start = i - (3 - phase);
                 if post_start > max_len {
-                    for column in &mut joint_coding_columns[phase] {
+                    for column in &mut queues.joint_coding[phase] {
                         column.expire_before(post_start - max_len);
                     }
                 }
@@ -6515,6 +7439,8 @@ fn align_genome_to_genome_forbidden(
         // per-column best joint starts into the required 2-D rectangle max.
         let mut joint_targets = JointIntronWindow::default();
         let mut target_window = IntronCandidateWindow::default();
+        let mut u3_joint_targets = JointIntronWindow::default();
+        let mut u3_target_window = IntronCandidateWindow::default();
         let mut coding_phase0 = IntronCandidateWindow::default();
         let mut coding_phase1 = IntronCandidateWindow::default();
         let mut coding_phase2 = IntronCandidateWindow::default();
@@ -6550,7 +7476,7 @@ fn align_genome_to_genome_forbidden(
             }
             if j >= min_len {
                 let source_j = j - min_len;
-                if let Some(candidate) = joint_columns[source_j].best() {
+                if let Some(candidate) = queues.joint[source_j].best() {
                     joint_targets.insert(candidate);
                 }
             }
@@ -6561,6 +7487,180 @@ fn align_genome_to_genome_forbidden(
                     .is_some_and(|entry| entry.target_start < j - max_len)
                 {
                     joint_targets.entries.pop_front();
+                }
+            }
+            // The post-CDS UTR has the same UTR intron graph as the pre-CDS
+            // UTR, but it is a distinct one-way subgraph.
+            if j >= min_len {
+                let source_j = j - min_len;
+                let source = idx(i, source_j, cols);
+                let (value, state) = best(&[
+                    (u3m[source], State::M),
+                    (u3i[source], State::I),
+                    (u3d[source], State::D),
+                ]);
+                if value > 0 {
+                    if let Some(donor) = splice_score(
+                        &target.bases,
+                        source_j,
+                        SpliceType::DonorForward,
+                        intron.force_gtag,
+                    ) {
+                        u3_target_window.insert(IntronCandidate {
+                            start: source_j,
+                            score: add(value, intron.open_penalty.saturating_add(donor)),
+                            state_rank: state.rank(),
+                        });
+                    }
+                }
+                if let Some(candidate) = queues.u3_joint[source_j].best() {
+                    u3_joint_targets.insert(candidate);
+                }
+            }
+            if j > max_len {
+                u3_target_window.expire_before(j - max_len);
+                while u3_joint_targets
+                    .entries
+                    .front()
+                    .is_some_and(|entry| entry.target_start < j - max_len)
+                {
+                    u3_joint_targets.entries.pop_front();
+                }
+            }
+
+            let u3_state = |rank| match state_from_rank(rank) {
+                State::M => GenomeState::U3M,
+                State::I => GenomeState::U3I,
+                State::D => GenomeState::U3D,
+                State::Stop => unreachable!(),
+            };
+            if j >= 2 {
+                if let (Some(candidate), Some(acceptor)) = (
+                    u3_target_window.best(),
+                    splice_score(
+                        &target.bases,
+                        j - 2,
+                        SpliceType::AcceptorForward,
+                        intron.force_gtag,
+                    ),
+                ) {
+                    genome_relax(
+                        &mut u3m[k],
+                        &mut pu3m[k],
+                        add(candidate.score, acceptor),
+                        u3_state(candidate.state_rank),
+                        TraceFragment::intron(
+                            TraceRun {
+                                transition_id: 40,
+                                op: Op::Splice5,
+                                query_advance: 0,
+                                target_advance: 2,
+                                repeats: 1,
+                            },
+                            TraceRun {
+                                transition_id: 41,
+                                op: Op::Intron,
+                                query_advance: 0,
+                                target_advance: (j - candidate.start - 4) as u32,
+                                repeats: 1,
+                            },
+                            TraceRun {
+                                transition_id: 42,
+                                op: Op::Splice3,
+                                query_advance: 0,
+                                target_advance: 2,
+                                repeats: 1,
+                            },
+                        ),
+                    );
+                }
+            }
+            if i >= 2 {
+                if let (Some(candidate), Some(acceptor)) = (
+                    queues.u3_query[j].best(),
+                    splice_score(
+                        &query.bases,
+                        i - 2,
+                        SpliceType::AcceptorForward,
+                        intron.force_gtag,
+                    ),
+                ) {
+                    genome_relax(
+                        &mut u3m[k],
+                        &mut pu3m[k],
+                        add(candidate.score, acceptor),
+                        u3_state(candidate.state_rank),
+                        TraceFragment::intron(
+                            TraceRun {
+                                transition_id: 43,
+                                op: Op::Splice5,
+                                query_advance: 2,
+                                target_advance: 0,
+                                repeats: 1,
+                            },
+                            TraceRun {
+                                transition_id: 44,
+                                op: Op::Intron,
+                                query_advance: (i - candidate.start - 4) as u32,
+                                target_advance: 0,
+                                repeats: 1,
+                            },
+                            TraceRun {
+                                transition_id: 45,
+                                op: Op::Splice3,
+                                query_advance: 2,
+                                target_advance: 0,
+                                repeats: 1,
+                            },
+                        ),
+                    );
+                }
+            }
+            if i >= 2 && j >= 2 {
+                if let (Some(candidate), Some(query_acceptor), Some(target_acceptor)) = (
+                    u3_joint_targets.best(),
+                    splice_score(
+                        &query.bases,
+                        i - 2,
+                        SpliceType::AcceptorForward,
+                        intron.force_gtag,
+                    ),
+                    splice_score(
+                        &target.bases,
+                        j - 2,
+                        SpliceType::AcceptorForward,
+                        intron.force_gtag,
+                    ),
+                ) {
+                    genome_relax(
+                        &mut u3m[k],
+                        &mut pu3m[k],
+                        add(add(candidate.score, query_acceptor), target_acceptor),
+                        u3_state(candidate.state_rank),
+                        TraceFragment::intron(
+                            TraceRun {
+                                transition_id: 46,
+                                op: Op::Splice5,
+                                query_advance: 2,
+                                target_advance: 2,
+                                repeats: 1,
+                            },
+                            TraceRun {
+                                transition_id: 47,
+                                op: Op::Intron,
+                                query_advance: (i - candidate.query_start - 4) as u32,
+                                target_advance: (j - candidate.target_start - 4) as u32,
+                                repeats: 1,
+                            },
+                            TraceRun {
+                                transition_id: 48,
+                                op: Op::Splice3,
+                                query_advance: 2,
+                                target_advance: 2,
+                                repeats: 1,
+                            },
+                        ),
+                    );
                 }
             }
 
@@ -6607,7 +7707,7 @@ fn align_genome_to_genome_forbidden(
             }
             if i >= 2 {
                 if let (Some(candidate), Some(acceptor)) = (
-                    query_windows[j].best(),
+                    queues.query[j].best(),
                     splice_score(
                         &query.bases,
                         i - 2,
@@ -6790,7 +7890,7 @@ fn align_genome_to_genome_forbidden(
                             SpliceType::DonorForward,
                             intron.force_gtag,
                         ) {
-                            query_coding_windows[phase][j].insert(IntronCandidate {
+                            queues.query_coding[phase][j].insert(IntronCandidate {
                                 start: donor,
                                 score: add(value, intron.open_penalty.saturating_add(donor_score)),
                                 state_rank: source_state.rank(),
@@ -6798,10 +7898,10 @@ fn align_genome_to_genome_forbidden(
                         }
                     }
                     if post_start > max_len {
-                        query_coding_windows[phase][j].expire_before(post_start - max_len);
+                        queues.query_coding[phase][j].expire_before(post_start - max_len);
                     }
                     if let (Some(candidate), Some(acceptor)) = (
-                        query_coding_windows[phase][j].best(),
+                        queues.query_coding[phase][j].best(),
                         splice_score(
                             &query.bases,
                             post_start - 2,
@@ -6906,7 +8006,7 @@ fn align_genome_to_genome_forbidden(
                     let query_post = i - post;
                     let target_post = j - post;
                     let target_donor = target_post - min_len;
-                    if let Some(candidate) = joint_coding_columns[phase][target_donor].best() {
+                    if let Some(candidate) = queues.joint_coding[phase][target_donor].best() {
                         joint_coding_targets[phase].insert(candidate);
                     }
                     if target_post > max_len {
@@ -7359,7 +8459,7 @@ fn align_genome_to_genome_forbidden(
                     }),
                 );
             }
-            if i >= 3 && j >= 3 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 3, j - 3))) {
+            if i >= 3 && j >= 3 && !forbidden_match_transition(forbidden, i - 3, j - 3, 3, 3) {
                 let p = idx(i - 3, j - 3, cols);
                 let (candidate, state) =
                     best(&[(cm[p], State::M), (ci[p], State::I), (cd[p], State::D)]);
@@ -7440,14 +8540,96 @@ fn align_genome_to_genome_forbidden(
                     );
                 }
             }
-            // Exit only from the coding match state, as in CDNA2Genome_create.
+            // The composed cDNA graph permits its CDS epsilon exit from every
+            // coding state.  Keeping the predecessor state is significant
+            // after a codon gap or frameshift at the boundary.
+            let (candidate, state) =
+                best(&[(cm[k], State::M), (ci[k], State::I), (cd[k], State::D)]);
             genome_relax(
-                &mut mat[k],
-                &mut pmat[k],
-                cm[k],
-                GenomeState::CdsM,
+                &mut u3m[k],
+                &mut pu3m[k],
+                candidate,
+                match state {
+                    State::M => GenomeState::CdsM,
+                    State::I => GenomeState::CdsI,
+                    State::D => GenomeState::CdsD,
+                    State::Stop => unreachable!(),
+                },
                 TraceFragment::empty(),
             );
+            if i > 0 && j > 0 && !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 1))) {
+                let source = idx(i - 1, j - 1, cols);
+                let (value, state) = best(&[
+                    (u3m[source], State::M),
+                    (u3i[source], State::I),
+                    (u3d[source], State::D),
+                ]);
+                genome_relax(
+                    &mut u3m[k],
+                    &mut pu3m[k],
+                    add(
+                        value,
+                        dna_score(query.bases[i - 1], target.bases[j - 1], scoring),
+                    ),
+                    match state {
+                        State::M => GenomeState::U3M,
+                        State::I => GenomeState::U3I,
+                        State::D => GenomeState::U3D,
+                        State::Stop => unreachable!(),
+                    },
+                    TraceFragment::one(TraceRun {
+                        transition_id: 30,
+                        op: Op::Match,
+                        query_advance: 1,
+                        target_advance: 1,
+                        repeats: 1,
+                    }),
+                );
+            }
+            if i > 0 {
+                let source = idx(i - 1, j, cols);
+                let (value, state, transition_id) =
+                    if add(u3m[source], scoring.gap_open) >= add(u3i[source], scoring.gap_extend) {
+                        (add(u3m[source], scoring.gap_open), GenomeState::U3M, 31)
+                    } else {
+                        (add(u3i[source], scoring.gap_extend), GenomeState::U3I, 32)
+                    };
+                genome_relax(
+                    &mut u3i[k],
+                    &mut pu3i[k],
+                    value,
+                    state,
+                    TraceFragment::one(TraceRun {
+                        transition_id,
+                        op: Op::Insert,
+                        query_advance: 1,
+                        target_advance: 0,
+                        repeats: 1,
+                    }),
+                );
+            }
+            if j > 0 {
+                let source = idx(i, j - 1, cols);
+                let (value, state, transition_id) =
+                    if add(u3m[source], scoring.gap_open) >= add(u3d[source], scoring.gap_extend) {
+                        (add(u3m[source], scoring.gap_open), GenomeState::U3M, 33)
+                    } else {
+                        (add(u3d[source], scoring.gap_extend), GenomeState::U3D, 34)
+                    };
+                genome_relax(
+                    &mut u3d[k],
+                    &mut pu3d[k],
+                    value,
+                    state,
+                    TraceFragment::one(TraceRun {
+                        transition_id,
+                        op: Op::Delete,
+                        query_advance: 0,
+                        target_advance: 1,
+                        repeats: 1,
+                    }),
+                );
+            }
             for (value, state) in [
                 (mat[k], GenomeState::UtrM),
                 (ins[k], GenomeState::UtrI),
@@ -7455,36 +8637,84 @@ fn align_genome_to_genome_forbidden(
                 (cm[k], GenomeState::CdsM),
                 (ci[k], GenomeState::CdsI),
                 (cd[k], GenomeState::CdsD),
+                (u3m[k], GenomeState::U3M),
+                (u3i[k], GenomeState::U3I),
+                (u3d[k], GenomeState::U3D),
             ] {
-                if (value, i, j) > (end.3, end.0, end.1) {
+                // Upstream retains the first endpoint at an equal score.  In
+                // particular this resolves reverse-orientation local paths
+                // before the later, shifted CDS/UTR equivalent.
+                if value > end.3 {
                     end = (i, j, state, value);
                 }
             }
         }
+        if let Some(checkpoints) = checkpoint_sink.as_deref_mut() {
+            if i % checkpoint_stride.max(1) == 0 || i == n {
+                let first_row = i + 1 - genome_checkpoint_history_rows(intron).min(i + 1);
+                let history = (first_row..=i)
+                    .map(|row| GenomeScoreRow {
+                        row,
+                        u5m: mat.row_clone(row),
+                        u5i: ins.row_clone(row),
+                        u5d: del.row_clone(row),
+                        cm: cm.row_clone(row),
+                        ci: ci.row_clone(row),
+                        cd: cd.row_clone(row),
+                        u3m: u3m.row_clone(row),
+                        u3i: u3i.row_clone(row),
+                        u3d: u3d.row_clone(row),
+                    })
+                    .collect();
+                checkpoints.push(GenomeCheckpoint {
+                    row: i,
+                    history,
+                    queues: queues.clone(),
+                });
+            }
+        }
     }
-    let (mut i, mut j, mut state, score) = end;
-    let final_state = state;
-    let (query_end, target_end) = (i as u64, j as u64);
-    let mut fragments = Vec::new();
-    loop {
-        let parent = match state {
-            GenomeState::UtrM => pmat[idx(i, j, cols)],
-            GenomeState::UtrI => pins[idx(i, j, cols)],
-            GenomeState::UtrD => pdel[idx(i, j, cols)],
-            GenomeState::CdsM => pcm[idx(i, j, cols)],
-            GenomeState::CdsI => pci[idx(i, j, cols)],
-            GenomeState::CdsD => pcd[idx(i, j, cols)],
+    let (end_i, end_j, final_state, score) = if let Some((i, j, state)) = forced_end {
+        debug_assert!(i <= n && j <= m);
+        let k = idx(i, j, cols);
+        let score = match state {
+            GenomeState::UtrM => mat[k],
+            GenomeState::UtrI => ins[k],
+            GenomeState::UtrD => del[k],
+            GenomeState::CdsM => cm[k],
+            GenomeState::CdsI => ci[k],
+            GenomeState::CdsD => cd[k],
+            GenomeState::U3M => u3m[k],
+            GenomeState::U3I => u3i[k],
+            GenomeState::U3D => u3d[k],
         };
-        let Some(parent) = parent else { break };
-        let raw_fragment = genome_raw_fragment(parent, state, i, j, query, target, scoring, intron);
-        let (qa, ta) = parent.fragment.advances();
-        debug_assert!(i >= qa && j >= ta);
-        i -= qa;
-        j -= ta;
-        fragments.push((parent.fragment, raw_fragment));
-        state = parent.state;
+        (i, j, state, score)
+    } else {
+        end
+    };
+    let (query_end, target_end) = (end_i as u64, end_j as u64);
+    let (i, j, start_state, fragments) = genome_traceback_fragments(
+        end_i,
+        end_j,
+        final_state,
+        cols,
+        &pmat,
+        &pins,
+        &pdel,
+        &pcm,
+        &pci,
+        &pcd,
+        &pu3m,
+        &pu3i,
+        &pu3d,
+        query,
+        target,
+        scoring,
+        intron,
+    );
+    if let Some(sink) = traceback_start_sink {
+        *sink = (i, j, start_state);
     }
-    fragments.reverse();
     let mut trace = Vec::new();
     let mut raw_trace = vec![RawStep {
         transition_id: 29,
@@ -7516,6 +8746,8 @@ fn align_genome_to_genome_forbidden(
         GenomeState::UtrD => Some(36),
         GenomeState::CdsI => Some(59),
         GenomeState::CdsD => Some(79),
+        GenomeState::U3I => Some(35),
+        GenomeState::U3D => Some(36),
         _ => None,
     };
     if let Some(transition_id) = terminal {
@@ -7564,7 +8796,172 @@ pub fn align_genome_to_genome(
     scoring: Scoring,
     intron: IntronScoring,
 ) -> Alignment {
-    align_genome_to_genome_forbidden(query, target, scoring, intron, None)
+    align_genome_to_genome_forbidden(
+        query, target, scoring, intron, None, false, None, None, None, None, 1,
+    )
+}
+
+/// Exact low-memory traceback for genome-to-genome.  The forward endpoint is
+/// found with rolling scores and no resident parent matrix; traceback then
+/// recomputes one parent-row block at a time.  Query/joint intron queues are
+/// rebuilt from the prefix for every block, which is slower than restoring
+/// the saved queue checkpoints but keeps memory bounded and preserves the
+/// exact recurrence while that faster restoration path is completed.
+fn align_genome_to_genome_checkpointed(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    budget_bytes: Option<u128>,
+) -> Alignment {
+    let mut endpoint_state = (0, 0, GenomeState::UtrM);
+    let endpoint = align_genome_to_genome_forbidden(
+        query,
+        target,
+        scoring,
+        intron,
+        None,
+        true,
+        Some((0, 0)),
+        None,
+        Some(&mut endpoint_state),
+        None,
+        1,
+    );
+    let final_state = endpoint_state.2;
+    let mut cursor = (
+        endpoint.query_end as usize,
+        endpoint.target_end as usize,
+        final_state,
+    );
+    let block_rows = budget_bytes
+        .map(|budget| {
+            genome_checkpoint_plan(query.bases.len(), target.bases.len(), intron, Some(budget))
+                .stride
+        })
+        .unwrap_or(64)
+        .max(genome_checkpoint_history_rows(intron))
+        .min(query.bases.len().max(1));
+    let mut trace_segments = Vec::new();
+    let mut raw_segments = Vec::new();
+    loop {
+        let first_row = cursor.0.saturating_sub(block_rows.saturating_sub(1));
+        let prefix = Sequence {
+            id: query.id.clone(),
+            bases: query.bases[..cursor.0].to_vec(),
+        };
+        let mut start = cursor;
+        let segment = align_genome_to_genome_forbidden(
+            &prefix,
+            target,
+            scoring,
+            intron,
+            None,
+            true,
+            Some((first_row, cursor.0)),
+            Some(cursor),
+            Some(&mut start),
+            None,
+            1,
+        );
+        let terminal_len = 2 + usize::from(genome_terminal_transition(cursor.2).is_some());
+        debug_assert!(segment.raw_trace.len() > terminal_len);
+        trace_segments.push(segment.trace);
+        raw_segments.push(segment.raw_trace[1..segment.raw_trace.len() - terminal_len].to_vec());
+        if start == cursor {
+            break;
+        }
+        cursor = start;
+    }
+    trace_segments.reverse();
+    raw_segments.reverse();
+    let mut trace = Vec::new();
+    for segment in trace_segments {
+        for run in segment {
+            TraceFragment::one(run).append_to(&mut trace);
+        }
+    }
+    let mut raw_trace = vec![RawStep {
+        transition_id: 29,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    }];
+    raw_trace.extend(raw_segments.into_iter().flatten());
+    if let Some(transition_id) = genome_terminal_transition(final_state) {
+        raw_trace.push(RawStep {
+            transition_id,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: if genome_state_is_coding(final_state) {
+            89
+        } else {
+            39
+        },
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    raw_trace.push(RawStep {
+        transition_id: 90,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    Alignment {
+        query_id: query.id.clone(),
+        target_id: target.id.clone(),
+        query_start: cursor.0 as u64,
+        query_end: endpoint.query_end,
+        query_strand: Strand::Forward,
+        target_start: cursor.1 as u64,
+        target_end: endpoint.target_end,
+        target_len: target.bases.len() as u64,
+        target_strand: Strand::Forward,
+        score: endpoint.score,
+        raw_trace,
+        trace,
+    }
+}
+
+fn genome_terminal_transition(state: GenomeState) -> Option<u16> {
+    match state {
+        GenomeState::UtrI | GenomeState::U3I => Some(35),
+        GenomeState::UtrD | GenomeState::U3D => Some(36),
+        GenomeState::CdsI => Some(59),
+        GenomeState::CdsD => Some(79),
+        GenomeState::UtrM | GenomeState::CdsM | GenomeState::U3M => None,
+    }
+}
+
+fn align_genome_to_genome_memory_aware(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    intron: IntronScoring,
+    rolling_scores: bool,
+    budget_bytes: Option<u128>,
+) -> Alignment {
+    if rolling_scores {
+        align_genome_to_genome_checkpointed(query, target, scoring, intron, budget_bytes)
+    } else {
+        align_genome_to_genome_forbidden(
+            query, target, scoring, intron, None, false, None, None, None, None, 1,
+        )
+    }
+}
+
+fn full_genome2genome_dp_bytes(query_len: usize, target_len: usize) -> u128 {
+    let cells = (query_len as u128 + 1) * (target_len as u128 + 1);
+    cells * 9 * (size_of::<Score>() as u128 + size_of::<Option<GenomeParent>>() as u128)
+}
+
+fn genome2genome_uses_low_memory(query_len: usize, target_len: usize, memory_mb: usize) -> bool {
+    full_genome2genome_dp_bytes(query_len, target_len) > ((memory_mb as u128) << 20)
 }
 
 pub fn align_genome_to_genome_suboptimal(
@@ -7575,7 +8972,19 @@ pub fn align_genome_to_genome_suboptimal(
     threshold: Score,
 ) -> Vec<Alignment> {
     enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
-        align_genome_to_genome_forbidden(query, target, scoring, intron, Some(forbidden))
+        align_genome_to_genome_forbidden(
+            query,
+            target,
+            scoring,
+            intron,
+            Some(forbidden),
+            false,
+            None,
+            None,
+            None,
+            None,
+            1,
+        )
     })
 }
 
@@ -7597,6 +9006,69 @@ pub fn align_genome_to_genome_database_suboptimal(
     out
 }
 
+/// Suboptimal genome-to-genome paths over all upstream orientation pairs.
+pub fn align_genome_to_genome_database_suboptimal_stranded(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            for alignment in
+                align_genome_to_genome_suboptimal(query, target, scoring, intron, threshold)
+            {
+                out.push(alignment);
+            }
+            if !both_strands {
+                continue;
+            }
+            let reverse_query = Sequence {
+                id: query.id.clone(),
+                bases: reverse_complement(&query.bases),
+            };
+            let reverse_target = Sequence {
+                id: target.id.clone(),
+                bases: reverse_complement(&target.bases),
+            };
+            for (oriented_query, query_reverse) in [(query, false), (&reverse_query, true)] {
+                for (oriented_target, target_reverse) in [(target, false), (&reverse_target, true)]
+                {
+                    if !query_reverse && !target_reverse {
+                        continue;
+                    }
+                    for mut alignment in align_genome_to_genome_suboptimal(
+                        oriented_query,
+                        oriented_target,
+                        scoring,
+                        intron,
+                        threshold,
+                    ) {
+                        alignment.target_id = target.id.clone();
+                        if target_reverse {
+                            alignment.target_start =
+                                target.bases.len() as u64 - alignment.target_start;
+                            alignment.target_end = target.bases.len() as u64 - alignment.target_end;
+                            alignment.target_strand = Strand::Reverse;
+                        }
+                        if query_reverse {
+                            alignment.query_start =
+                                query.bases.len() as u64 - alignment.query_start;
+                            alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                            alignment.query_strand = Strand::Reverse;
+                        }
+                        out.push(alignment);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn align_genome_to_genome_database(
     queries: &[Sequence],
     targets: &[Sequence],
@@ -7611,6 +9083,73 @@ pub fn align_genome_to_genome_database(
                 .map(move |target| align_genome_to_genome(query, target, scoring, intron))
         })
         .collect()
+}
+
+/// Genome-to-genome database alignment over the upstream four orientation
+/// combinations when `both_strands` is enabled.
+pub fn align_genome_to_genome_database_stranded(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    intron: IntronScoring,
+    both_strands: bool,
+    memory_mb: usize,
+) -> Vec<Alignment> {
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            let rolling_scores =
+                genome2genome_uses_low_memory(query.bases.len(), target.bases.len(), memory_mb);
+            out.push(align_genome_to_genome_memory_aware(
+                query,
+                target,
+                scoring,
+                intron,
+                rolling_scores,
+                rolling_scores.then_some((memory_mb as u128) << 20),
+            ));
+            if !both_strands {
+                continue;
+            }
+            let reverse_query = Sequence {
+                id: query.id.clone(),
+                bases: reverse_complement(&query.bases),
+            };
+            let reverse_target = Sequence {
+                id: target.id.clone(),
+                bases: reverse_complement(&target.bases),
+            };
+            for (oriented_query, query_reverse) in [(query, false), (&reverse_query, true)] {
+                for (oriented_target, target_reverse) in [(target, false), (&reverse_target, true)]
+                {
+                    if !query_reverse && !target_reverse {
+                        continue;
+                    }
+                    let mut alignment = align_genome_to_genome_memory_aware(
+                        oriented_query,
+                        oriented_target,
+                        scoring,
+                        intron,
+                        rolling_scores,
+                        rolling_scores.then_some((memory_mb as u128) << 20),
+                    );
+                    alignment.target_id = target.id.clone();
+                    if target_reverse {
+                        alignment.target_start = target.bases.len() as u64 - alignment.target_start;
+                        alignment.target_end = target.bases.len() as u64 - alignment.target_end;
+                        alignment.target_strand = Strand::Reverse;
+                    }
+                    if query_reverse {
+                        alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+                        alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                        alignment.query_strand = Strand::Reverse;
+                    }
+                    out.push(alignment);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Local coding-DNA to coding-DNA Viterbi with codon affine gaps and
@@ -8020,6 +9559,7 @@ fn protein2genome_alignment_oriented(
     bestfit: bool,
     forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
+    let intron = canonical_intron_scoring(intron);
     let (n, m, cols) = (query.bases.len(), bases.len(), bases.len() + 1);
     let size = (n + 1) * (m + 1);
     let mut mm = vec![0; size];
@@ -8225,7 +9765,7 @@ fn protein2genome_alignment_oriented(
                 let (source, state) =
                     best(&[(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]);
                 let value = add(source, sub);
-                if value > mm[k] {
+                if value >= mm[k] {
                     mm[k] = value;
                     pm[k] = Some(P2GenomeParent {
                         state,
@@ -8354,8 +9894,8 @@ fn protein2genome_alignment_oriented(
     let (target_start, target_end) = match strand {
         Strand::Forward => (j as u64, oriented_target_end),
         Strand::Reverse => (
-            (target.bases.len() as u64).saturating_sub(oriented_target_end),
             (target.bases.len() as u64).saturating_sub(j as u64),
+            (target.bases.len() as u64).saturating_sub(oriented_target_end),
         ),
         Strand::Unknown => unreachable!("protein2genome uses a concrete target strand"),
     };
@@ -8522,6 +10062,32 @@ pub fn align_coding_to_genome(
             Strand::Reverse,
             None,
         ));
+
+        // Coding DNA is itself strand-specific.  Upstream searches both
+        // query orientations as well as both target orientations; remap the
+        // reverse-query coordinates back onto the caller's forward sequence.
+        let reverse_query = Sequence {
+            id: query.id.clone(),
+            bases: reverse_complement(&query.bases),
+        };
+        for (bases, strand) in [
+            (&target.bases, Strand::Forward),
+            (&reverse, Strand::Reverse),
+        ] {
+            let mut alignment = coding2genome_alignment_oriented(
+                &reverse_query,
+                target,
+                bases,
+                scoring,
+                intron,
+                strand,
+                None,
+            );
+            alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+            alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+            alignment.query_strand = Strand::Reverse;
+            out.push(alignment);
+        }
     }
     out
 }
@@ -8549,6 +10115,7 @@ fn coding2genome_alignment_oriented(
     strand: Strand,
     forbidden: Option<&HashSet<(usize, usize)>>,
 ) -> Alignment {
+    let intron = canonical_intron_scoring(intron);
     let (n, m, cols) = (query.bases.len(), bases.len(), bases.len() + 1);
     let size = (n + 1) * (m + 1);
     let mut mm = vec![0; size];
@@ -8772,7 +10339,7 @@ fn coding2genome_alignment_oriented(
                 let (source, state) =
                     best(&[(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]);
                 let value = add(source, sub);
-                if value > mm[k] {
+                if value >= mm[k] {
                     mm[k] = value;
                     pm[k] = Some(P2GenomeParent {
                         state,
@@ -8901,8 +10468,8 @@ fn coding2genome_alignment_oriented(
     let (target_start, target_end) = match strand {
         Strand::Forward => (j as u64, oriented_target_end),
         Strand::Reverse => (
-            (target.bases.len() as u64).saturating_sub(oriented_target_end),
             (target.bases.len() as u64).saturating_sub(j as u64),
+            (target.bases.len() as u64).saturating_sub(oriented_target_end),
         ),
         Strand::Unknown => unreachable!("coding2genome uses a concrete target strand"),
     };
@@ -8959,6 +10526,34 @@ pub fn align_coding_to_genome_suboptimal(
                 )
             },
         ));
+
+        let reverse_query = Sequence {
+            id: query.id.clone(),
+            bases: reverse_complement(&query.bases),
+        };
+        for (bases, strand) in [
+            (&target.bases, Strand::Forward),
+            (&reverse, Strand::Reverse),
+        ] {
+            for mut alignment in
+                enumerate_suboptimal_pair(&reverse_query, target, threshold, |forbidden| {
+                    coding2genome_alignment_oriented(
+                        &reverse_query,
+                        target,
+                        bases,
+                        scoring,
+                        intron,
+                        strand,
+                        Some(forbidden),
+                    )
+                })
+            {
+                alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+                alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                alignment.query_strand = Strand::Reverse;
+                out.push(alignment);
+            }
+        }
     }
     out
 }
@@ -9112,7 +10707,7 @@ fn align_protein_to_dna_direct(
                 let aa = translate_dna(&oriented[j - 3..j], 0)[0];
                 let sub = protein_score(query.bases[i - 1], aa, scoring);
                 let mut candidate = (NEG_INF, State::Stop, None);
-                if !forbidden.is_some_and(|pairs| pairs.contains(&(i - 1, j - 3))) {
+                if !forbidden_match_transition(forbidden, i - 1, j - 3, 1, 3) {
                     for (value, state) in [(mm[p], State::M), (ii[p], State::I), (dd[p], State::D)]
                     {
                         p2_update(
@@ -9313,8 +10908,8 @@ fn align_protein_to_dna_direct(
         (j as u64, target_end)
     } else {
         (
-            target.bases.len() as u64 - target_end,
             target.bases.len() as u64 - j as u64,
+            target.bases.len() as u64 - target_end,
         )
     };
     Alignment {
@@ -9807,6 +11402,38 @@ mod tests {
     }
 
     #[test]
+    fn codon_match_suboptimal_exclusion_blocks_each_nucleotide_pair() {
+        let alignment = Alignment {
+            query_id: "query".into(),
+            target_id: "target".into(),
+            query_start: 3,
+            query_end: 6,
+            query_strand: Strand::Forward,
+            target_start: 9,
+            target_end: 12,
+            target_len: 20,
+            target_strand: Strand::Forward,
+            score: 1,
+            raw_trace: Vec::new(),
+            trace: vec![TraceRun {
+                transition_id: 1,
+                op: Op::Match,
+                query_advance: 3,
+                target_advance: 3,
+                repeats: 1,
+            }],
+        };
+        let mut forbidden = HashSet::new();
+        assert_eq!(
+            forbid_alignment_pairs(&alignment, 20, 20, &mut forbidden),
+            3
+        );
+        assert_eq!(forbidden, HashSet::from([(3, 9), (4, 10), (5, 11)]));
+        assert!(forbidden_match_transition(Some(&forbidden), 3, 9, 3, 3));
+        assert!(forbidden_match_transition(Some(&forbidden), 4, 10, 3, 3));
+    }
+
+    #[test]
     fn suboptimal_local_paths_are_score_ordered_and_pair_disjoint() {
         let query = s("query", "ACGTACGTACGT");
         let target = s("target", "ACGTGGGGACGT");
@@ -10059,7 +11686,7 @@ mod tests {
         .find(|candidate| candidate.target_strand == Strand::Reverse)
         .expect("reverse-strand protein2genome alignment");
         assert_eq!(reverse.score, 125);
-        assert_eq!((reverse.target_start, reverse.target_end), (0, 133));
+        assert_eq!((reverse.target_start, reverse.target_end), (133, 0));
     }
 
     #[test]
@@ -10183,6 +11810,276 @@ mod tests {
             });
         assert_eq!(query_span, alignment.query_end - alignment.query_start);
         assert_eq!(target_span, alignment.target_end - alignment.target_start);
+    }
+
+    #[test]
+    fn genome2genome_rolling_score_rows_preserve_full_traceback() {
+        let query = s(
+            "query",
+            concat!(
+                "AGCCCAGCCAAGCACTGTCAGGAATCCTG",
+                "GTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAG",
+                "TGAAGCAGCTCCAGCTATGTGTGAAGAA",
+                "GAGGACAGCACTGCCTTGGTGTGTGACAATG",
+                "GTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAG",
+                "GCTCTGGGCTCTGTAAGGCCGGCTTTGCT"
+            ),
+        );
+        let target = s(
+            "target",
+            concat!(
+                "AGCCCAGCCAAGCACTGTCAGGAATCCTG",
+                "GTNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNAG",
+                "TGAAGCAGCTCCAGCTATGTGTGAAGAAGAGGACAGCACTGCCTTGGTGTGTGACAATGGC",
+                "TCTGGGCTCTGTAAGGCCGGCTTTGCT"
+            ),
+        );
+        let full = align_genome_to_genome(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+        );
+        let rolling = align_genome_to_genome_forbidden(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(rolling.score, full.score);
+        assert_eq!(rolling.sugar(), full.sugar());
+        assert_eq!(rolling.cigar(), full.cigar());
+        assert_eq!(rolling.vulgar(), full.vulgar());
+        assert_eq!(rolling.raw_trace, full.raw_trace);
+    }
+
+    #[test]
+    fn checkpointed_genome2genome_preserves_the_complete_traceback() {
+        let query = s("query", &"ACGT".repeat(45));
+        let target = s(
+            "target",
+            &format!("{}{}", "N".repeat(23), "ACGT".repeat(45)),
+        );
+        let full = align_genome_to_genome(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+        );
+        let checkpointed = align_genome_to_genome_checkpointed(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            None,
+        );
+        assert_eq!(checkpointed.score, full.score);
+        assert_eq!(checkpointed.sugar(), full.sugar());
+        assert_eq!(checkpointed.cigar(), full.cigar());
+        assert_eq!(checkpointed.vulgar(), full.vulgar());
+        assert_eq!(checkpointed.trace, full.trace);
+        assert_eq!(checkpointed.raw_trace, full.raw_trace);
+    }
+
+    #[test]
+    fn budgeted_genome2genome_checkpoint_replay_preserves_the_complete_traceback() {
+        let query = s("query", &"ACGT".repeat(45));
+        let target = s(
+            "target",
+            &format!("{}{}", "N".repeat(23), "ACGT".repeat(45)),
+        );
+        let full = align_genome_to_genome(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+        );
+        let checkpointed = align_genome_to_genome_checkpointed(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            Some(0),
+        );
+        assert_eq!(checkpointed.score, full.score);
+        assert_eq!(checkpointed.sugar(), full.sugar());
+        assert_eq!(checkpointed.cigar(), full.cigar());
+        assert_eq!(checkpointed.vulgar(), full.vulgar());
+        assert_eq!(checkpointed.trace, full.trace);
+        assert_eq!(checkpointed.raw_trace, full.raw_trace);
+    }
+
+    #[test]
+    fn genome2genome_parent_block_preserves_the_forward_endpoint() {
+        let query = s("query", "ACGTACGTACGTACGTACGTACGT");
+        let target = s("target", "NNNNACGTACGTACGTACGTACGTACGTNN");
+        let full = align_genome_to_genome(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+        );
+        // A forward pass with only row zero of each parent lane retained is
+        // the first half of checkpoint replay.  It cannot traceback yet, but
+        // must select exactly the same local endpoint and score.
+        let blocked = align_genome_to_genome_forbidden(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            None,
+            true,
+            Some((0, 0)),
+            None,
+            None,
+            None,
+            1,
+        );
+        assert_eq!(blocked.score, full.score);
+        assert_eq!(blocked.query_end, full.query_end);
+        assert_eq!(blocked.target_end, full.target_end);
+        assert!(blocked.trace.is_empty());
+
+        let replayed_block = align_genome_to_genome_forbidden(
+            &query,
+            &target,
+            Scoring::default(),
+            IntronScoring::default(),
+            None,
+            true,
+            Some((12, 24)),
+            Some((
+                full.query_end as usize,
+                full.target_end as usize,
+                GenomeState::UtrM,
+            )),
+            None,
+            None,
+            1,
+        );
+        assert_eq!(replayed_block.score, full.score);
+        assert_eq!(replayed_block.query_end, full.query_end);
+        assert_eq!(replayed_block.target_end, full.target_end);
+        // A retained row may contain a five-base frameshift whose source lies
+        // just before the block boundary; the next replay begins there.
+        assert!((7..=12).contains(&replayed_block.query_start));
+        assert!(!replayed_block.trace.is_empty());
+    }
+
+    #[test]
+    fn genome2genome_checkpoints_capture_score_history_and_live_queues() {
+        let query = s("query", &"TGG".repeat(40));
+        let target = s(
+            "target",
+            &format!(
+                "{}GT{}AG{}",
+                "TGG".repeat(12),
+                "N".repeat(30),
+                "TGG".repeat(28)
+            ),
+        );
+        let intron = IntronScoring {
+            min_len: 30,
+            max_len: 80,
+            ..IntronScoring::default()
+        };
+        let mut checkpoints = Vec::new();
+        let rolling = align_genome_to_genome_forbidden(
+            &query,
+            &target,
+            Scoring::default(),
+            intron,
+            None,
+            true,
+            None,
+            None,
+            None,
+            Some(&mut checkpoints),
+            17,
+        );
+        assert!(rolling.score > 0);
+        assert_eq!(
+            checkpoints.first().map(|checkpoint| checkpoint.row),
+            Some(0)
+        );
+        assert_eq!(
+            checkpoints.last().map(|checkpoint| checkpoint.row),
+            Some(query.bases.len())
+        );
+        assert!(checkpoints.iter().all(|checkpoint| {
+            checkpoint.history.last().map(|row| row.row) == Some(checkpoint.row)
+                && checkpoint.history.len() <= genome_checkpoint_history_rows(intron)
+        }));
+        assert!(
+            checkpoints
+                .iter()
+                .any(|checkpoint| checkpoint.queues.checkpoint_bytes() > 0)
+        );
+
+        let checkpoint = checkpoints.last().expect("final checkpoint");
+        let cols = target.bases.len() + 1;
+        let history_rows = genome_checkpoint_history_rows(intron);
+        let mut u5m = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut u5i = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut u5d = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut cm = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut ci = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut cd = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut u3m = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut u3i = GenomeScoreMatrix::rolling(cols, history_rows);
+        let mut u3d = GenomeScoreMatrix::rolling(cols, history_rows);
+        restore_genome_checkpoint_scores(
+            checkpoint, &mut u5m, &mut u5i, &mut u5d, &mut cm, &mut ci, &mut cd, &mut u3m,
+            &mut u3i, &mut u3d,
+        );
+        let final_row = checkpoint.history.last().expect("checkpoint final row");
+        assert_eq!(u5m.row_clone(final_row.row), final_row.u5m);
+        assert_eq!(cm.row_clone(final_row.row), final_row.cm);
+        assert_eq!(u3d.row_clone(final_row.row), final_row.u3d);
+    }
+
+    #[test]
+    fn genome_parent_block_retains_only_its_reconstruction_rows() {
+        let cols = 5;
+        let mut parents = GenomeParentMatrix::block(cols, 3, 4);
+        parents[idx(3, 2, cols)] = Some(GenomeParent {
+            state: GenomeState::UtrM,
+            fragment: CompactGenomeFragment::from_trace_fragment(TraceFragment::empty()),
+        });
+        parents[idx(2, 2, cols)] = Some(GenomeParent {
+            state: GenomeState::CdsM,
+            fragment: CompactGenomeFragment::from_trace_fragment(TraceFragment::empty()),
+        });
+        assert_eq!(
+            parents[idx(3, 2, cols)].map(|parent| parent.state),
+            Some(GenomeState::UtrM)
+        );
+    }
+
+    #[test]
+    fn genome_parent_fragment_is_compacter_than_public_trace_fragment() {
+        assert!(
+            size_of::<CompactGenomeFragment>() < size_of::<TraceFragment>(),
+            "the resident g2g parent fragment must stay smaller than its public trace form"
+        );
+    }
+
+    #[test]
+    fn genome_rolling_scores_restore_checkpoint_history_by_row_number() {
+        let mut scores = GenomeScoreMatrix::rolling(3, 4);
+        scores.restore_row(8, &[10, 11, 12]);
+        scores.restore_row(9, &[20, 21, 22]);
+        assert_eq!(scores.row_clone(8), vec![10, 11, 12]);
+        assert_eq!(scores.row_clone(9), vec![20, 21, 22]);
+        scores.start_row(10, NEG_INF);
+        assert_eq!(scores.row_clone(10), vec![NEG_INF; 3]);
     }
 
     #[test]
@@ -10544,7 +12441,7 @@ mod tests {
         .find(|candidate| candidate.target_strand == Strand::Reverse)
         .expect("reverse-strand coding2genome alignment");
         assert_eq!(reverse.score, 194);
-        assert_eq!((reverse.target_start, reverse.target_end), (0, 151));
+        assert_eq!((reverse.target_start, reverse.target_end), (151, 0));
     }
 
     #[test]
@@ -10683,11 +12580,11 @@ mod tests {
                 alignment.target_end,
                 alignment.target_strand
             ),
-            (3, 9, Strand::Reverse)
+            (9, 3, Strand::Reverse)
         );
         assert_eq!(
             alignment.vulgar(),
-            "vulgar: protein 0 2 . dna 3 9 - 9 M 2 6"
+            "vulgar: protein 0 2 . dna 9 3 - 9 M 2 6"
         );
     }
     #[test]
@@ -10913,6 +12810,210 @@ mod tests {
             Some((3, 3))
         );
     }
+
+    #[test]
+    fn intron_window_snapshots_preserve_candidates_independently() {
+        let mut window = IntronCandidateWindow::default();
+        window.insert(IntronCandidate {
+            start: 2,
+            score: 9,
+            state_rank: 1,
+        });
+        let snapshot = window.clone();
+        window.expire_before(3);
+        assert!(window.best().is_none());
+        assert_eq!(snapshot.best().map(|candidate| candidate.start), Some(2));
+
+        let mut joint = JointIntronWindow::default();
+        joint.insert(JointIntronCandidate {
+            query_start: 4,
+            target_start: 7,
+            score: 12,
+            state_rank: 2,
+        });
+        let snapshot = joint.clone();
+        joint.expire_before(5);
+        assert!(joint.best().is_none());
+        assert_eq!(
+            snapshot
+                .best()
+                .map(|candidate| (candidate.query_start, candidate.target_start)),
+            Some((4, 7))
+        );
+    }
+
+    #[test]
+    fn genome_intron_queue_checkpoint_size_includes_live_candidates() {
+        let mut queues = GenomeIntronQueues::new(1);
+        let empty = 5 * size_of::<IntronCandidateWindow>() + 5 * size_of::<JointIntronWindow>();
+        assert_eq!(queues.checkpoint_bytes(), empty);
+
+        queues.query[0].insert(IntronCandidate {
+            start: 3,
+            score: 11,
+            state_rank: 2,
+        });
+        queues.joint_coding[2][0].insert(JointIntronCandidate {
+            query_start: 4,
+            target_start: 6,
+            score: 12,
+            state_rank: 3,
+        });
+        assert_eq!(
+            queues.checkpoint_bytes(),
+            empty + size_of::<IntronCandidate>() + size_of::<JointIntronCandidate>()
+        );
+    }
+
+    #[test]
+    fn genome_intron_queue_snapshot_preserves_each_queue_family() {
+        let mut queues = GenomeIntronQueues::new(1);
+        queues.query[0].insert(IntronCandidate {
+            start: 1,
+            score: 10,
+            state_rank: 1,
+        });
+        queues.query_coding[1][0].insert(IntronCandidate {
+            start: 2,
+            score: 11,
+            state_rank: 2,
+        });
+        queues.u3_query[0].insert(IntronCandidate {
+            start: 3,
+            score: 12,
+            state_rank: 3,
+        });
+        queues.joint[0].insert(JointIntronCandidate {
+            query_start: 3,
+            target_start: 4,
+            score: 12,
+            state_rank: 3,
+        });
+        queues.u3_joint[0].insert(JointIntronCandidate {
+            query_start: 4,
+            target_start: 5,
+            score: 13,
+            state_rank: 4,
+        });
+        queues.joint_coding[2][0].insert(JointIntronCandidate {
+            query_start: 5,
+            target_start: 6,
+            score: 13,
+            state_rank: 4,
+        });
+
+        let snapshot = queues.clone();
+        queues.query[0].expire_before(2);
+        queues.query_coding[1][0].expire_before(3);
+        queues.u3_query[0].expire_before(4);
+        queues.joint[0].expire_before(4);
+        queues.u3_joint[0].expire_before(5);
+        queues.joint_coding[2][0].expire_before(6);
+
+        assert!(queues.query[0].best().is_none());
+        assert!(queues.query_coding[1][0].best().is_none());
+        assert!(queues.u3_query[0].best().is_none());
+        assert!(queues.joint[0].best().is_none());
+        assert!(queues.u3_joint[0].best().is_none());
+        assert!(queues.joint_coding[2][0].best().is_none());
+        assert_eq!(
+            snapshot.query[0].best().map(|candidate| candidate.start),
+            Some(1)
+        );
+        assert_eq!(
+            snapshot.query_coding[1][0]
+                .best()
+                .map(|candidate| candidate.start),
+            Some(2)
+        );
+        assert_eq!(
+            snapshot.u3_query[0].best().map(|candidate| candidate.start),
+            Some(3)
+        );
+        assert_eq!(
+            snapshot.joint[0]
+                .best()
+                .map(|candidate| (candidate.query_start, candidate.target_start)),
+            Some((3, 4))
+        );
+        assert_eq!(
+            snapshot.u3_joint[0]
+                .best()
+                .map(|candidate| (candidate.query_start, candidate.target_start)),
+            Some((4, 5))
+        );
+        assert_eq!(
+            snapshot.joint_coding[2][0]
+                .best()
+                .map(|candidate| (candidate.query_start, candidate.target_start)),
+            Some((5, 6))
+        );
+    }
+
+    #[test]
+    fn genome_checkpoint_history_covers_phase_introns_and_frameshifts() {
+        assert_eq!(
+            genome_checkpoint_history_rows(IntronScoring {
+                min_len: 4,
+                ..IntronScoring::default()
+            }),
+            8
+        );
+        assert_eq!(
+            genome_checkpoint_history_rows(IntronScoring {
+                min_len: 30,
+                ..IntronScoring::default()
+            }),
+            34
+        );
+    }
+
+    #[test]
+    fn genome_checkpoint_queue_bound_covers_a_populated_snapshot() {
+        let intron = IntronScoring {
+            min_len: 2,
+            max_len: 4,
+            ..IntronScoring::default()
+        };
+        let mut queues = GenomeIntronQueues::new(2);
+        for column in 0..2 {
+            for start in 0..3 {
+                queues.query[column].entries.push_back(IntronCandidate {
+                    start,
+                    score: start as Score,
+                    state_rank: 0,
+                });
+                queues.query_coding[0][column]
+                    .entries
+                    .push_back(IntronCandidate {
+                        start,
+                        score: start as Score,
+                        state_rank: 0,
+                    });
+                queues.joint[column]
+                    .entries
+                    .push_back(JointIntronCandidate {
+                        query_start: start,
+                        target_start: start,
+                        score: start as Score,
+                        state_rank: 0,
+                    });
+                queues.joint_coding[0][column]
+                    .entries
+                    .push_back(JointIntronCandidate {
+                        query_start: start,
+                        target_start: start,
+                        score: start as Score,
+                        state_rank: 0,
+                    });
+            }
+        }
+        assert!(
+            genome_checkpoint_queue_upper_bound_bytes(2, intron)
+                >= queues.checkpoint_bytes() as u128
+        );
+    }
+
     #[test]
     fn intron_window_keeps_best_eligible_start_in_linear_space() {
         let mut window = IntronWindow::default();
@@ -11624,6 +13725,31 @@ mod tests {
     }
 
     #[test]
+    fn generic_c4_short_intron_minimum_keeps_splice_loop_nonnegative() {
+        let exon = "ACGT".repeat(10);
+        let query = s("query", &exon);
+        let target = s("target", &format!("{}GTAG{}", &exon[..20], &exon[20..]));
+        let intron = IntronScoring {
+            min_len: 2,
+            max_len: 20,
+            open_penalty: -1,
+            force_gtag: true,
+        };
+        let actual = align_model_ir_with_intron(
+            &query,
+            &target,
+            &model::est2genome(2, 20),
+            Scoring::default(),
+            intron,
+            Strand::Forward,
+        )
+        .expect("short intron IR must compile without underflow");
+        assert!(actual.trace.iter().any(|run| {
+            run.op == Op::Intron && run.query_advance == 0 && run.target_advance == 0
+        }));
+    }
+
+    #[test]
     fn model_ir_rejects_invalid_graphs() {
         use crate::model::{ModelError, ScoreKernel};
         let mut cyclic = Model::Ungapped.ir();
@@ -11690,7 +13816,7 @@ mod tests {
         };
         assert_eq!(
             alignment.cigar(),
-            "cigar: protein 0 1 . dna 0 4 + -19  D 1 M 3"
+            "cigar: protein 0 1 . dna 0 4 + -19 D 1 M 3"
         );
         assert_eq!(
             alignment.vulgar(),

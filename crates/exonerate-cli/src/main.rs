@@ -1,27 +1,35 @@
 use exonerate_core::{
     Alignment, HeuristicConfig, IntronScoring, Model, RawStep, Scoring, Sequence, Strand,
-    align_cdna_to_genome_database, align_cdna_to_genome_database_heuristic,
-    align_cdna_to_genome_database_suboptimal, align_coding_to_genome_database,
+    align_cdna_to_genome_database_heuristic, align_cdna_to_genome_database_suboptimal,
+    align_cdna_to_genome_database_with_dp_memory_stranded,
     align_coding_to_genome_database_heuristic, align_coding_to_genome_database_suboptimal,
-    align_coding2coding_database, align_coding2coding_database_suboptimal,
-    align_database_heuristic, align_database_suboptimal, align_database_with_dp_memory,
-    align_est2genome_database, align_est2genome_database_heuristic,
-    align_est2genome_database_suboptimal, align_genome_to_genome_database,
-    align_genome_to_genome_database_heuristic, align_genome_to_genome_database_suboptimal,
-    align_ner_database, align_ner_database_suboptimal, align_protein_database_with_dp_memory,
-    align_protein_to_dna_database, align_protein_to_dna_database_suboptimal,
-    align_protein_to_genome_bestfit_database, align_protein_to_genome_bestfit_database_heuristic,
-    align_protein_to_genome_database, align_protein_to_genome_database_heuristic,
-    align_protein_to_genome_database_suboptimal, align_ungapped_translated_database,
-    align_ungapped_translated_database_suboptimal, dna_self_score, protein_self_score, read_fasta,
-    reverse_complement, translated_self_score,
+    align_coding_to_genome_database_with_dp_memory, align_coding2coding_database,
+    align_coding2coding_database_suboptimal, align_database_heuristic, align_database_suboptimal,
+    align_database_with_dp_memory, align_est2genome_database_heuristic,
+    align_est2genome_database_suboptimal, align_est2genome_database_with_dp_memory,
+    align_genome_to_genome_database_heuristic_stranded,
+    align_genome_to_genome_database_heuristic_stranded_with_rolling_scores,
+    align_genome_to_genome_database_stranded, align_genome_to_genome_database_suboptimal_stranded,
+    align_ner_database, align_ner_database_suboptimal, align_protein_database_suboptimal,
+    align_protein_database_with_dp_memory, align_protein_to_dna_database,
+    align_protein_to_dna_database_suboptimal, align_protein_to_genome_bestfit_database_heuristic,
+    align_protein_to_genome_database_heuristic, align_protein_to_genome_database_suboptimal,
+    align_protein_to_genome_database_with_dp_memory, align_ungapped_translated_database,
+    align_ungapped_translated_database_suboptimal, dna_self_score, dna_substitution_score,
+    protein_self_score, protein_substitution_score, read_fasta, reverse_complement, translate_dna,
+    translated_self_score,
 };
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Write};
 use std::process::ExitCode;
 
 fn usage() -> &'static str {
-    "Usage: exonerate-rs [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive] [--revcomp yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
+    "Usage: exonerate-rs [--shorthelp|--help] [--version] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
+}
+
+fn version() -> String {
+    format!("exonerate-rs {}", env!("CARGO_PKG_VERSION"))
 }
 fn yes_no(value: &str) -> Result<bool, String> {
     match value {
@@ -65,8 +73,18 @@ fn sequence_type(sequence: &Sequence) -> &'static str {
     }
 }
 
-fn sequence_text(sequence: &Sequence) -> String {
-    String::from_utf8_lossy(&sequence.bases).into_owned()
+/// Upstream's `Sequence_print_fasta_block`: sequence RYO fields have no
+/// header, but they are still FASTA-wrapped at 70 columns and end in `\n`.
+fn fasta_block_text(bases: &[u8]) -> String {
+    if bases.is_empty() {
+        return String::new();
+    }
+    let mut output = String::with_capacity(bases.len() + bases.len() / 70 + 1);
+    for chunk in bases.chunks(70) {
+        output.push_str(&String::from_utf8_lossy(chunk));
+        output.push('\n');
+    }
+    output
 }
 
 fn aligned_sequence_text(sequence: &Sequence, start: u64, end: u64, strand: Strand) -> String {
@@ -80,6 +98,205 @@ fn aligned_sequence_text(sequence: &Sequence, start: u64, end: u64, strand: Stra
     String::from_utf8_lossy(&bases).into_owned()
 }
 
+#[derive(Default)]
+struct RyoStats {
+    total: u64,
+    identical: u64,
+    similar: u64,
+    gaps: u64,
+    match_score: i64,
+    self_score: i64,
+}
+
+struct CodingRegion {
+    begin: u64,
+    end: u64,
+    bases: Vec<u8>,
+}
+
+fn ryo_symbol(sequence: &Sequence, position: u64, advance: u32, strand: Strand) -> Option<u8> {
+    let advance = advance as usize;
+    if !matches!(advance, 1 | 3) {
+        return None;
+    }
+    let start = if strand == Strand::Reverse {
+        position.checked_sub(advance as u64)? as usize
+    } else {
+        position as usize
+    };
+    let end = start.checked_add(advance)?;
+    let bases = sequence.bases.get(start..end)?;
+    let oriented = if strand == Strand::Reverse {
+        reverse_complement(bases)
+    } else {
+        bases.to_vec()
+    };
+    Some(if advance == 3 {
+        translate_dna(&oriented, 0)[0]
+    } else {
+        oriented[0]
+    })
+}
+
+fn ryo_stats(alignment: &Alignment, query: &Sequence, target: &Sequence) -> RyoStats {
+    let mut stats = RyoStats::default();
+    let mut query_position = if alignment.query_strand == Strand::Reverse {
+        alignment.query_start.max(alignment.query_end)
+    } else {
+        alignment.query_start.min(alignment.query_end)
+    };
+    let mut target_position = if alignment.target_strand == Strand::Reverse {
+        alignment.target_start.max(alignment.target_end)
+    } else {
+        alignment.target_start.min(alignment.target_end)
+    };
+    for run in &alignment.trace {
+        for _ in 0..run.repeats {
+            if run.op == exonerate_core::Op::Match {
+                let query_symbol = ryo_symbol(
+                    query,
+                    query_position,
+                    run.query_advance,
+                    alignment.query_strand,
+                );
+                let target_symbol = ryo_symbol(
+                    target,
+                    target_position,
+                    run.target_advance,
+                    alignment.target_strand,
+                );
+                if let (Some(query_symbol), Some(target_symbol)) = (query_symbol, target_symbol) {
+                    let protein = run.query_advance == 3
+                        || run.target_advance == 3
+                        || sequence_type(query) == "protein"
+                        || sequence_type(target) == "protein";
+                    let score = if protein {
+                        protein_substitution_score(query_symbol, target_symbol)
+                    } else {
+                        dna_substitution_score(query_symbol, target_symbol)
+                    };
+                    let self_score = if protein {
+                        protein_substitution_score(query_symbol, query_symbol)
+                    } else {
+                        dna_substitution_score(query_symbol, query_symbol)
+                    };
+                    stats.total += 1;
+                    stats.identical += u64::from(query_symbol.eq_ignore_ascii_case(&target_symbol));
+                    stats.similar += u64::from(score > 0);
+                    stats.match_score += i64::from(score);
+                    stats.self_score += i64::from(self_score);
+                }
+            } else if matches!(
+                run.op,
+                exonerate_core::Op::Insert | exonerate_core::Op::Delete
+            ) {
+                stats.gaps += 1;
+            }
+            let query_advance = u64::from(run.query_advance);
+            let target_advance = u64::from(run.target_advance);
+            query_position = if alignment.query_strand == Strand::Reverse {
+                query_position.saturating_sub(query_advance)
+            } else {
+                query_position + query_advance
+            };
+            target_position = if alignment.target_strand == Strand::Reverse {
+                target_position.saturating_sub(target_advance)
+            } else {
+                target_position + target_advance
+            };
+        }
+    }
+    stats
+}
+
+fn ryo_oriented_bases(
+    sequence: &Sequence,
+    position: u64,
+    advance: u32,
+    strand: Strand,
+) -> Option<Vec<u8>> {
+    let advance = advance as usize;
+    let start = if strand == Strand::Reverse {
+        position.checked_sub(advance as u64)? as usize
+    } else {
+        position as usize
+    };
+    let end = start.checked_add(advance)?;
+    let bases = sequence.bases.get(start..end)?;
+    Some(if strand == Strand::Reverse {
+        reverse_complement(bases)
+    } else {
+        bases.to_vec()
+    })
+}
+
+fn ryo_coding_region(
+    alignment: &Alignment,
+    sequence: &Sequence,
+    on_query: bool,
+) -> Option<CodingRegion> {
+    let strand = if on_query {
+        alignment.query_strand
+    } else {
+        alignment.target_strand
+    };
+    let (start, end) = if on_query {
+        (alignment.query_start, alignment.query_end)
+    } else {
+        (alignment.target_start, alignment.target_end)
+    };
+    let mut position = if strand == Strand::Reverse {
+        start.max(end)
+    } else {
+        start.min(end)
+    };
+    let mut region: Option<CodingRegion> = None;
+    for run in &alignment.trace {
+        let advance = if on_query {
+            run.query_advance
+        } else {
+            run.target_advance
+        };
+        for _ in 0..run.repeats {
+            let include = match run.op {
+                exonerate_core::Op::Match => advance == 3,
+                exonerate_core::Op::SplitCodon => advance > 0,
+                exonerate_core::Op::Insert | exonerate_core::Op::Delete => advance == 3,
+                _ => false,
+            };
+            if include {
+                let bases = ryo_oriented_bases(sequence, position, advance, strand)?;
+                if let Some(region) = &mut region {
+                    region.bases.extend(bases);
+                    if run.op == exonerate_core::Op::Match && advance == 3 {
+                        region.end = position;
+                    }
+                } else if run.op == exonerate_core::Op::Match && advance == 3 {
+                    region = Some(CodingRegion {
+                        begin: position,
+                        end: position,
+                        bases,
+                    });
+                }
+            }
+            position = if strand == Strand::Reverse {
+                position.saturating_sub(u64::from(advance))
+            } else {
+                position + u64::from(advance)
+            };
+        }
+    }
+    region
+}
+
+fn percent(numerator: i64, denominator: i64) -> String {
+    if denominator == 0 {
+        "0.00".to_owned()
+    } else {
+        format!("{:.2}", numerator as f64 * 100.0 / denominator as f64)
+    }
+}
+
 fn report_tail(report: &str) -> String {
     report
         .split_whitespace()
@@ -88,15 +305,98 @@ fn report_tail(report: &str) -> String {
         .join(" ")
 }
 
+/// Return the complete definition text for each FASTA record, excluding `>`.
+///
+/// The core reader intentionally retains only the identifier because that is
+/// all alignment needs.  RYO's `%qd` and `%td` are reporting fields, however,
+/// and upstream prints the full definition line there.
+fn read_fasta_definitions(path: &str) -> Result<HashMap<String, String>, String> {
+    let file = File::open(path).map_err(|error| format!("failed to open {path}: {error}"))?;
+    let mut definitions = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| format!("failed to read {path}: {error}"))?;
+        let Some(definition) = line.strip_prefix('>') else {
+            continue;
+        };
+        let definition = definition.trim_end_matches('\r');
+        let id = definition
+            .split_whitespace()
+            .next()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| format!("empty FASTA definition in {path}"))?;
+        definitions.insert(id.to_owned(), definition.to_owned());
+    }
+    Ok(definitions)
+}
+
+/// Select the FASTA records in the same byte-range chunk used by upstream's
+/// `FastaDB_open_list_with_limit`.  Boundaries are advanced to the next FASTA
+/// header so a record is never split between workers.
+fn fasta_chunk(
+    path: &str,
+    records: Vec<Sequence>,
+    chunk_id: usize,
+    chunk_total: usize,
+) -> Result<Vec<Sequence>, String> {
+    if chunk_total == 0 {
+        return Ok(records);
+    }
+    if chunk_id == 0 || chunk_id > chunk_total {
+        return Err(format!("chunk id should be between 1 and {chunk_total}"));
+    }
+    let bytes = fs::read(path).map_err(|error| format!("failed to read {path}: {error}"))?;
+    if bytes.is_empty() {
+        return Ok(records);
+    }
+    let find_next_start = |position: usize| {
+        let mut previous = b'\n';
+        for (offset, byte) in bytes.iter().enumerate().skip(position) {
+            if *byte == b'>' && previous == b'\n' {
+                return offset;
+            }
+            previous = *byte;
+        }
+        bytes.len() - 1
+    };
+    let chunk_size = bytes.len() / chunk_total;
+    let start = find_next_start((chunk_id - 1) * chunk_size);
+    let stop = if chunk_id == chunk_total {
+        bytes.len() - 1
+    } else {
+        find_next_start(chunk_id * chunk_size)
+    };
+    let headers = bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(offset, byte)| {
+            (*byte == b'>' && (offset == 0 || bytes[offset - 1] == b'\n')).then_some(offset)
+        })
+        .collect::<Vec<_>>();
+    if headers.len() != records.len() {
+        return Err(format!(
+            "failed to locate FASTA record boundaries in {path}"
+        ));
+    }
+    Ok(records
+        .into_iter()
+        .zip(headers)
+        .filter_map(|(record, header)| ((start..stop).contains(&header)).then_some(record))
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_ryo_plain(
     format: &str,
     alignment: &Alignment,
     query: &Sequence,
     target: &Sequence,
+    query_definition: &str,
+    target_definition: &str,
     model: &str,
     rank: usize,
 ) -> Result<String, String> {
     let chars = format.chars().collect::<Vec<_>>();
+    let stats = ryo_stats(alignment, query, target);
     let mut output = String::new();
     let mut index = 0;
     while index < chars.len() {
@@ -129,6 +429,36 @@ fn render_ryo_plain(
             's' => output.push_str(&alignment.score.to_string()),
             'r' => output.push_str(&rank.to_string()),
             'm' => output.push_str(model),
+            'e' => {
+                let Some(&field) = chars.get(index) else {
+                    return Err("incomplete equivalenced ryo token".into());
+                };
+                index += 1;
+                match field {
+                    't' => output.push_str(&stats.total.to_string()),
+                    'i' => output.push_str(&stats.identical.to_string()),
+                    's' => output.push_str(&stats.similar.to_string()),
+                    'm' => output.push_str(&(stats.total - stats.identical).to_string()),
+                    other => return Err(format!("unknown equivalenced ryo token %e{other}")),
+                }
+            }
+            'p' => {
+                let Some(&field) = chars.get(index) else {
+                    return Err("incomplete percent ryo token".into());
+                };
+                index += 1;
+                let total = stats.total as i64;
+                match field {
+                    'c' => output.push_str(&percent(total, query.bases.len() as i64)),
+                    'i' => output.push_str(&percent(stats.identical as i64, total)),
+                    'I' => {
+                        output.push_str(&percent(stats.identical as i64, total + stats.gaps as i64))
+                    }
+                    's' => output.push_str(&percent(stats.similar as i64, total)),
+                    'S' => output.push_str(&percent(stats.match_score, stats.self_score)),
+                    other => return Err(format!("unknown percent ryo token %p{other}")),
+                }
+            }
             'g' => output.push(strand_symbol(alignment.target_strand)),
             'S' => output.push_str(alignment.sugar().strip_prefix("sugar: ").unwrap()),
             'C' => {
@@ -139,6 +469,11 @@ fn render_ryo_plain(
             'q' | 't' => {
                 let is_query = token == 'q';
                 let sequence = if is_query { query } else { target };
+                let definition = if is_query {
+                    query_definition
+                } else {
+                    target_definition
+                };
                 let (start, end, strand) = if is_query {
                     (
                         alignment.query_start,
@@ -157,9 +492,17 @@ fn render_ryo_plain(
                 };
                 index += 1;
                 match field {
-                    'i' | 'd' => output.push_str(&sequence.id),
+                    'i' => output.push_str(&sequence.id),
+                    'd' => output.push_str(definition),
                     'l' => output.push_str(&sequence.bases.len().to_string()),
-                    's' => output.push_str(&sequence_text(sequence)),
+                    's' => {
+                        let bases = if strand == Strand::Reverse {
+                            reverse_complement(&sequence.bases)
+                        } else {
+                            sequence.bases.clone()
+                        };
+                        output.push_str(&fasta_block_text(&bases));
+                    }
                     'S' => output.push(strand_symbol(strand)),
                     't' => output.push_str(sequence_type(sequence)),
                     'a' | 'c' => {
@@ -167,12 +510,33 @@ fn render_ryo_plain(
                             return Err("incomplete aligned-region ryo token".into());
                         };
                         index += 1;
+                        let coding_region = (field == 'c')
+                            .then(|| ryo_coding_region(alignment, sequence, is_query))
+                            .flatten();
+                        if field == 'c' && coding_region.is_none() {
+                            return Err(format!(
+                                "%{token}c requires a coding region in the alignment"
+                            ));
+                        }
+                        let (region_start, region_end, region_sequence) =
+                            if let Some(region) = coding_region {
+                                (
+                                    region.begin,
+                                    region.end,
+                                    String::from_utf8_lossy(&region.bases).into_owned(),
+                                )
+                            } else {
+                                (
+                                    start,
+                                    end,
+                                    aligned_sequence_text(sequence, start, end, strand),
+                                )
+                            };
                         match region_field {
-                            'b' => output.push_str(&start.to_string()),
-                            'e' => output.push_str(&end.to_string()),
-                            'l' => output.push_str(&start.abs_diff(end).to_string()),
-                            's' => output
-                                .push_str(&aligned_sequence_text(sequence, start, end, strand)),
+                            'b' => output.push_str(&region_start.to_string()),
+                            'e' => output.push_str(&region_end.to_string()),
+                            'l' => output.push_str(&region_sequence.len().to_string()),
+                            's' => output.push_str(&fasta_block_text(region_sequence.as_bytes())),
                             other => {
                                 return Err(format!(
                                     "unknown ryo region token %{token}{field}{other}"
@@ -548,17 +912,29 @@ fn render_transition_ryo(
     Ok(output)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_ryo(
     format: &str,
     alignment: &Alignment,
     query: &Sequence,
     target: &Sequence,
+    query_definition: &str,
+    target_definition: &str,
     model: &str,
     rank: usize,
 ) -> Result<String, String> {
     let chars = format.chars().collect::<Vec<_>>();
     let Some(open) = chars.iter().position(|character| *character == '{') else {
-        return render_ryo_plain(format, alignment, query, target, model, rank);
+        return render_ryo_plain(
+            format,
+            alignment,
+            query,
+            target,
+            query_definition,
+            target_definition,
+            model,
+            rank,
+        );
     };
     let close = chars
         .iter()
@@ -569,7 +945,16 @@ fn render_ryo(
     let prefix = chars[..open].iter().collect::<String>();
     let body = chars[open + 1..close].iter().collect::<String>();
     let suffix = chars[close + 1..].iter().collect::<String>();
-    let mut output = render_ryo_plain(&prefix, alignment, query, target, model, rank)?;
+    let mut output = render_ryo_plain(
+        &prefix,
+        alignment,
+        query,
+        target,
+        query_definition,
+        target_definition,
+        model,
+        rank,
+    )?;
     let mut query_position = alignment.query_start;
     let mut target_position = alignment.target_start;
     let raw_steps = if alignment.raw_trace.is_empty() {
@@ -613,7 +998,16 @@ fn render_ryo(
             target_position + target_advance
         };
     }
-    output.push_str(&render_ryo(&suffix, alignment, query, target, model, rank)?);
+    output.push_str(&render_ryo(
+        &suffix,
+        alignment,
+        query,
+        target,
+        query_definition,
+        target_definition,
+        model,
+        rank,
+    )?);
     Ok(output)
 }
 
@@ -634,6 +1028,38 @@ fn write_stdout(text: &str, newline: bool) -> Result<(), String> {
     }
 }
 
+fn pretty_alignment(
+    alignment: &Alignment,
+    query: &Sequence,
+    target: &Sequence,
+    report_model: &str,
+) -> String {
+    let rendered = alignment.pretty(query, target);
+    // Upstream's generic affine views omit a model line, while the composed
+    // and translated model views identify their concrete C4 graph there.
+    let needs_model_line = !matches!(
+        report_model,
+        "ungapped:dna2dna"
+            | "affine:global:dna2dna"
+            | "affine:bestfit:dna2dna"
+            | "affine:local:dna2dna"
+            | "affine:overlap:dna2dna"
+            | "affine:global:protein2protein"
+            | "affine:bestfit:protein2protein"
+            | "affine:local:protein2protein"
+            | "affine:overlap:protein2protein"
+    );
+    if !needs_model_line {
+        return rendered;
+    }
+    let target_header = format!("        Target: {}\n", target.id);
+    rendered.replacen(
+        &target_header,
+        &format!("{target_header}         Model: {report_model}\n"),
+        1,
+    )
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -644,9 +1070,10 @@ fn main() -> ExitCode {
     }
 }
 fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     let mut model = Model::Ungapped;
     let mut model_name = "ungapped".to_owned();
+    let mut model_selected = false;
     let mut scoring = Scoring::default();
     let mut intron = IntronScoring::default();
     let mut est2genome = false;
@@ -660,17 +1087,22 @@ fn run() -> Result<(), String> {
     let mut ungapped_translated = false;
     let (mut min_ner, mut max_ner, mut ner_open) = (10_u32, 50_000_u32, -20_i32);
     let mut both = true;
+    let mut forward_coordinates = true;
     let mut query_type = "dna".to_owned();
     let mut target_type = "dna".to_owned();
+    let mut query_type_explicit = false;
+    let mut target_type_explicit = false;
+    let (mut query_chunk_id, mut query_chunk_total) = (0_usize, 0_usize);
+    let (mut target_chunk_id, mut target_chunk_total) = (0_usize, 0_usize);
     let (mut sugar, mut cigar, mut vulgar, mut gff) = (false, false, true, false);
     let mut query_gff = false;
-    let mut min_score: Option<i32> = None;
+    let mut min_score: Option<i32> = Some(100);
     let mut percent: Option<f64> = None;
     let mut best_n: Option<usize> = None;
     let mut ryo: Option<String> = None;
     let (mut query_file, mut target_file): (Option<String>, Option<String>) = (None, None);
     let mut show_alignment = false;
-    let mut subopt = false;
+    let mut subopt = true;
     let mut exhaustive = false;
     let mut dp_memory_mb = 32_usize;
     let mut heuristic = HeuristicConfig::default();
@@ -678,7 +1110,11 @@ fn run() -> Result<(), String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-m" | "--model" => {
+                if model_selected {
+                    return Err("model was already specified".into());
+                }
                 let selected = args.next().ok_or("missing model")?;
+                model_selected = true;
                 model_name = selected.clone();
                 match selected.as_str() {
                     "ungapped:trans" | "u:t" => {
@@ -846,9 +1282,53 @@ fn run() -> Result<(), String> {
             }
             "-q" | "--query" => query_file = Some(args.next().ok_or("missing query path")?),
             "-t" | "--target" => target_file = Some(args.next().ok_or("missing target path")?),
-            "-Q" | "--querytype" => query_type = args.next().ok_or("missing query type")?,
-            "-T" | "--targettype" => target_type = args.next().ok_or("missing target type")?,
-            "-E" | "--exhaustive" => exhaustive = true,
+            "-Q" | "--querytype" => {
+                query_type = args.next().ok_or("missing query type")?;
+                query_type_explicit = true;
+            }
+            "-T" | "--targettype" => {
+                target_type = args.next().ok_or("missing target type")?;
+                target_type_explicit = true;
+            }
+            "--querychunkid" => {
+                query_chunk_id = args
+                    .next()
+                    .ok_or("missing query chunk id")?
+                    .parse()
+                    .map_err(|_| "invalid query chunk id")?
+            }
+            "--querychunktotal" => {
+                query_chunk_total = args
+                    .next()
+                    .ok_or("missing query chunk total")?
+                    .parse()
+                    .map_err(|_| "invalid query chunk total")?
+            }
+            "--targetchunkid" => {
+                target_chunk_id = args
+                    .next()
+                    .ok_or("missing target chunk id")?
+                    .parse()
+                    .map_err(|_| "invalid target chunk id")?
+            }
+            "--targetchunktotal" => {
+                target_chunk_total = args
+                    .next()
+                    .ok_or("missing target chunk total")?
+                    .parse()
+                    .map_err(|_| "invalid target chunk total")?
+            }
+            "-E" => exhaustive = true,
+            "--exhaustive" => {
+                exhaustive = if args
+                    .peek()
+                    .is_some_and(|value| matches!(value.as_str(), "yes" | "no"))
+                {
+                    yes_no(&args.next().expect("checked exhaustive value"))?
+                } else {
+                    true
+                }
+            }
             "-D" | "--dpmemory" => {
                 dp_memory_mb = args
                     .next()
@@ -886,6 +1366,10 @@ fn run() -> Result<(), String> {
                 show_alignment = yes_no(&args.next().ok_or("missing showalignment value")?)?
             }
             "-r" | "--revcomp" => both = yes_no(&args.next().ok_or("missing revcomp value")?)?,
+            "--forwardcoordinates" => {
+                forward_coordinates =
+                    yes_no(&args.next().ok_or("missing forwardcoordinates value")?)?
+            }
             "--forwardonly" => both = false,
             "--showsugar" => sugar = yes_no(&args.next().ok_or("missing showsugar value")?)?,
             "--showcigar" => cigar = yes_no(&args.next().ok_or("missing showcigar value")?)?,
@@ -894,8 +1378,12 @@ fn run() -> Result<(), String> {
                 gff = yes_no(&args.next().ok_or("missing target GFF value")?)?
             }
             "--showquerygff" => query_gff = yes_no(&args.next().ok_or("missing query GFF value")?)?,
-            "-h" | "--help" => {
+            "-h" | "--shorthelp" | "--help" => {
                 write_stdout(usage(), true)?;
+                return Ok(());
+            }
+            "-v" | "--version" => {
+                write_stdout(&version(), true)?;
                 return Ok(());
             }
             x if x.starts_with('-') => return Err(format!("unknown option {x}")),
@@ -926,9 +1414,99 @@ fn run() -> Result<(), String> {
     if min_ner > max_ner {
         return Err("minimum NER length must not exceed maximum NER length".into());
     }
-    let q = read_fasta(&files[0]).map_err(|e| e.to_string())?;
-    let t = read_fasta(&files[1]).map_err(|e| e.to_string())?;
-    let mut alignments = if subopt {
+    if !matches!(query_type.as_str(), "dna" | "protein") {
+        return Err(format!(
+            "query type must be dna or protein, got {query_type:?}"
+        ));
+    }
+    if !matches!(target_type.as_str(), "dna" | "protein") {
+        return Err(format!(
+            "target type must be dna or protein, got {target_type:?}"
+        ));
+    }
+    let requires_dna_pair = ungapped_translated
+        || ner
+        || est2genome
+        || coding2coding
+        || coding2genome
+        || cdna2genome
+        || genome2genome;
+    let requires_protein_to_dna = protein2genome
+        || protein2genome_bestfit
+        || matches!(
+            model_name.as_str(),
+            "protein2dna" | "p2d" | "protein2dna:bestfit" | "p2d:b"
+        );
+    let q = fasta_chunk(
+        &files[0],
+        read_fasta(&files[0]).map_err(|e| e.to_string())?,
+        query_chunk_id,
+        query_chunk_total,
+    )?;
+    let t = fasta_chunk(
+        &files[1],
+        read_fasta(&files[1]).map_err(|e| e.to_string())?,
+        target_chunk_id,
+        target_chunk_total,
+    )?;
+    if !query_type_explicit && !requires_dna_pair && !requires_protein_to_dna {
+        query_type = if q
+            .iter()
+            .any(|sequence| sequence_type(sequence) == "protein")
+        {
+            "protein".to_owned()
+        } else {
+            "dna".to_owned()
+        };
+    }
+    if !target_type_explicit && !requires_dna_pair && !requires_protein_to_dna {
+        target_type = if t
+            .iter()
+            .any(|sequence| sequence_type(sequence) == "protein")
+        {
+            "protein".to_owned()
+        } else {
+            "dna".to_owned()
+        };
+    }
+    if requires_dna_pair && (query_type != "dna" || target_type != "dna") {
+        return Err(format!(
+            "model {model_name} requires DNA query and target sequences"
+        ));
+    }
+    if requires_protein_to_dna && (query_type != "protein" || target_type != "dna") {
+        return Err(format!(
+            "model {model_name} requires a protein query and DNA target"
+        ));
+    }
+    let query_definitions = if ryo.is_some() {
+        read_fasta_definitions(&files[0])?
+    } else {
+        HashMap::new()
+    };
+    let target_definitions = if ryo.is_some() {
+        read_fasta_definitions(&files[1])?
+    } else {
+        HashMap::new()
+    };
+    // Upstream's `--bestn` requests an HSP set, which necessarily enumerates
+    // suboptimal paths before it applies the per-query rank cutoff.  Keep the
+    // pre-existing single-path fallback for the model families whose
+    // suboptimal executor has not been implemented yet.
+    let suboptimal_supported = ungapped_translated
+        || ner
+        || est2genome
+        || coding2coding
+        || genome2genome
+        || cdna2genome
+        || coding2genome
+        || protein2genome
+        || protein2genome_bestfit
+        || (query_type == "dna" && target_type == "dna" && model == Model::Local)
+        || (query_type == "protein"
+            && target_type == "dna"
+            && matches!(model, Model::Local | Model::BestFit));
+    let mut alignments = if suboptimal_supported && (subopt || best_n.is_some()) {
         let plain_dna_local = !ungapped_translated
             && !ner
             && !coding2coding
@@ -953,6 +1531,18 @@ fn run() -> Result<(), String> {
             && query_type == "protein"
             && target_type == "dna"
             && matches!(model, Model::Local | Model::BestFit);
+        let protein_affine_local = !ungapped_translated
+            && !ner
+            && !coding2coding
+            && !genome2genome
+            && !cdna2genome
+            && !coding2genome
+            && !protein2genome
+            && !protein2genome_bestfit
+            && !est2genome
+            && query_type == "protein"
+            && target_type == "protein"
+            && model == Model::Local;
         if ungapped_translated {
             align_ungapped_translated_database_suboptimal(
                 &q,
@@ -977,12 +1567,13 @@ fn run() -> Result<(), String> {
         } else if coding2coding {
             align_coding2coding_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
         } else if genome2genome {
-            align_genome_to_genome_database_suboptimal(
+            align_genome_to_genome_database_suboptimal_stranded(
                 &q,
                 &t,
                 scoring,
                 intron,
                 min_score.unwrap_or(100),
+                both,
             )
         } else if cdna2genome {
             align_cdna_to_genome_database_suboptimal(
@@ -1020,6 +1611,8 @@ fn run() -> Result<(), String> {
                 min_score.unwrap_or(100),
                 both,
             )
+        } else if protein_affine_local {
+            align_protein_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
         } else if plain_dna_local {
             align_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
         } else {
@@ -1033,25 +1626,53 @@ fn run() -> Result<(), String> {
         align_coding2coding_database(&q, &t, scoring)
     } else if genome2genome {
         if exhaustive {
-            align_genome_to_genome_database(&q, &t, scoring, intron)
+            align_genome_to_genome_database_stranded(&q, &t, scoring, intron, both, dp_memory_mb)
+        } else if dp_memory_mb == 0 {
+            align_genome_to_genome_database_heuristic_stranded_with_rolling_scores(
+                &q, &t, scoring, intron, both, heuristic, true,
+            )
         } else {
-            align_genome_to_genome_database_heuristic(&q, &t, scoring, intron, heuristic)
+            align_genome_to_genome_database_heuristic_stranded(
+                &q, &t, scoring, intron, both, heuristic,
+            )
         }
     } else if cdna2genome {
         if exhaustive {
-            align_cdna_to_genome_database(&q, &t, scoring, intron)
+            align_cdna_to_genome_database_with_dp_memory_stranded(
+                &q,
+                &t,
+                scoring,
+                intron,
+                both,
+                dp_memory_mb,
+            )
         } else {
             align_cdna_to_genome_database_heuristic(&q, &t, scoring, intron, heuristic)
         }
     } else if coding2genome {
         if exhaustive {
-            align_coding_to_genome_database(&q, &t, scoring, intron, both)
+            align_coding_to_genome_database_with_dp_memory(
+                &q,
+                &t,
+                scoring,
+                intron,
+                both,
+                dp_memory_mb,
+            )
         } else {
             align_coding_to_genome_database_heuristic(&q, &t, scoring, intron, both, heuristic)
         }
     } else if protein2genome_bestfit {
         if exhaustive {
-            align_protein_to_genome_bestfit_database(&q, &t, scoring, intron, both)
+            align_protein_to_genome_database_with_dp_memory(
+                &q,
+                &t,
+                scoring,
+                intron,
+                both,
+                true,
+                dp_memory_mb,
+            )
         } else {
             align_protein_to_genome_bestfit_database_heuristic(
                 &q, &t, scoring, intron, both, heuristic,
@@ -1059,13 +1680,21 @@ fn run() -> Result<(), String> {
         }
     } else if protein2genome {
         if exhaustive {
-            align_protein_to_genome_database(&q, &t, scoring, intron, both)
+            align_protein_to_genome_database_with_dp_memory(
+                &q,
+                &t,
+                scoring,
+                intron,
+                both,
+                false,
+                dp_memory_mb,
+            )
         } else {
             align_protein_to_genome_database_heuristic(&q, &t, scoring, intron, both, heuristic)
         }
     } else if est2genome {
         if exhaustive {
-            align_est2genome_database(&q, &t, intron, both)
+            align_est2genome_database_with_dp_memory(&q, &t, intron, both, dp_memory_mb)
         } else {
             align_est2genome_database_heuristic(&q, &t, intron, both, heuristic)
         }
@@ -1118,6 +1747,7 @@ fn run() -> Result<(), String> {
             f64::from(alignment.score) * 100.0 >= f64::from(self_score) * percent
         });
     }
+    let best_n = best_n.filter(|&count| count > 0);
     if let Some(best_n) = best_n {
         alignments.sort_by(|left, right| {
             left.query_id
@@ -1125,14 +1755,43 @@ fn run() -> Result<(), String> {
                 .then_with(|| right.score.cmp(&left.score))
                 .then_with(|| left.target_id.cmp(&right.target_id))
                 .then_with(|| left.target_start.cmp(&right.target_start))
+                .then_with(|| left.query_start.cmp(&right.query_start))
+                .then_with(|| left.target_end.cmp(&right.target_end))
+                .then_with(|| left.query_end.cmp(&right.query_end))
         });
-        let mut seen: HashMap<String, usize> = HashMap::new();
+        let mut seen: HashMap<String, (usize, Option<i32>)> = HashMap::new();
         alignments.retain(|alignment| {
-            let count = seen.entry(alignment.query_id.clone()).or_default();
-            let keep = *count < best_n;
+            let (count, cutoff) = seen.entry(alignment.query_id.clone()).or_default();
             *count += 1;
-            keep
+            if *count <= best_n {
+                if *count == best_n {
+                    *cutoff = Some(alignment.score);
+                }
+                true
+            } else {
+                cutoff.is_some_and(|score| alignment.score == score)
+            }
         });
+    }
+    if !forward_coordinates {
+        let query_lengths: HashMap<_, _> = q
+            .iter()
+            .map(|sequence| (sequence.id.as_str(), sequence.bases.len() as u64))
+            .collect();
+        for alignment in &mut alignments {
+            if alignment.query_strand == Strand::Reverse {
+                let length = query_lengths
+                    .get(alignment.query_id.as_str())
+                    .copied()
+                    .expect("alignment query comes from the input database");
+                alignment.query_start = length - alignment.query_start;
+                alignment.query_end = length - alignment.query_end;
+            }
+            if alignment.target_strand == Strand::Reverse {
+                alignment.target_start = alignment.target_len - alignment.target_start;
+                alignment.target_end = alignment.target_len - alignment.target_end;
+            }
+        }
     }
     let report_model = if ungapped_translated {
         "ungapped:trans".to_owned()
@@ -1175,14 +1834,19 @@ fn run() -> Result<(), String> {
                 q.iter().find(|sequence| sequence.id == a.query_id),
                 t.iter().find(|sequence| sequence.id == a.target_id),
             ) {
-                write_stdout(&a.pretty(query, target), false)?;
+                write_stdout(&pretty_alignment(&a, query, target, &report_model), false)?;
             }
         }
         if sugar {
             write_stdout(&a.sugar(), true)?
         }
         if cigar {
-            write_stdout(&a.cigar(), true)?
+            let cigar_output = if cdna2genome || genome2genome {
+                a.cdna_cigar()
+            } else {
+                a.cigar()
+            };
+            write_stdout(&cigar_output, true)?
         }
         if vulgar {
             write_stdout(&a.vulgar(), true)?
@@ -1202,8 +1866,25 @@ fn run() -> Result<(), String> {
                 .iter()
                 .find(|sequence| sequence.id == a.target_id)
                 .ok_or_else(|| format!("target record not found for {}", a.target_id))?;
+            let query_definition = query_definitions
+                .get(&query.id)
+                .map(String::as_str)
+                .unwrap_or(&query.id);
+            let target_definition = target_definitions
+                .get(&target.id)
+                .map(String::as_str)
+                .unwrap_or(&target.id);
             let report_rank = if best_n.is_some() { *rank } else { 0 };
-            let rendered = render_ryo(format, &a, query, target, &report_model, report_rank)?;
+            let rendered = render_ryo(
+                format,
+                &a,
+                query,
+                target,
+                query_definition,
+                target_definition,
+                &report_model,
+                report_rank,
+            )?;
             write_stdout(&rendered, false)?;
         }
     }
@@ -1237,6 +1918,8 @@ mod tests {
             &alignment,
             &query,
             &target,
+            "q",
+            "t",
             "affine:local:dna2dna",
             0,
         )
@@ -1260,7 +1943,7 @@ mod tests {
             Scoring::default(),
             Strand::Forward,
         );
-        assert!(render_ryo("%x", &alignment, &sequence, &sequence, "m", 0).is_err());
+        assert!(render_ryo("%x", &alignment, &sequence, &sequence, "s", "s", "m", 0).is_err());
     }
 
     #[test]
@@ -1293,6 +1976,8 @@ mod tests {
             &alignment,
             &query,
             &target,
+            "q",
+            "t",
             "affine:global:dna2dna",
             0,
         )

@@ -40,6 +40,14 @@ cargo run --release -p exonerate -- --model est2genome \
 # emit GFF3 match / match_part records from the traceback
 cargo run --release -p exonerate -- --model est2genome \
   --showvulgar no --showgff yes est.fa genome.fa
+
+# RYO supports definitions, coding ranges, equivalenced counts and percentages
+cargo run --release -p exonerate -- --model coding2genome \
+  --ryo '%qi %qd %qcb %qce %et %ei %pi\n' coding.fa genome.fa
+
+# Use reverse-oriented coordinates instead of the default forward-reference form
+cargo run --release -p exonerate -- --model protein2genome \
+  --forwardcoordinates no protein.fa genome.fa
 ```
 
 ## Heuristic DNA search
@@ -47,6 +55,10 @@ cargo run --release -p exonerate -- --model est2genome \
 `affine:local` uses exact k-mer seeds to select a padded candidate rectangle, then runs the unchanged exact Viterbi/traceback kernel inside that rectangle. Use `-E` or `--exhaustive` to force the full matrix. `--wordlen`, `--seedpadding`, and `--seedrepeat` control seeding; ambiguous or seedless inputs fall back to exhaustive alignment.
 
 On the checked 3,000 x 5,000 nt planted-alignment fixture, the release build produced the identical `M 800 800` vulgar path in 0.02 s and 28,116 KiB maximum RSS, versus 0.20 s and 221,816 KiB for `-E`. These figures are regression evidence, not a cross-machine performance guarantee.
+
+## DP memory planning
+
+`-D` / `--dpmemory` takes a MiB planning budget. For affine models, `est2genome`, `protein2genome`, `coding2genome`, and `cdna2genome`, an exhaustive run switches to exact checkpointed traceback when the full matrix estimate exceeds that budget. The planner minimizes its estimated checkpoint footprint; if even one rolling DP row cannot fit (including `-D 0`), it still runs the minimum-footprint checkpoint plan. Exhaustive `genome2genome` likewise feeds the budget to its checkpoint-block planner, uses rolling score rows, and replays compact parent blocks; it currently rebuilds the required prefix for each block, trading additional CPU time for bounded parent memory. Thus `-D 0` is a deterministic low-memory-path selector, not a literal zero-byte or RSS hard cap.
 
 See [`exonerate.md`](exonerate.md) for the staged architecture and
 [`COMPATIBILITY.md`](COMPATIBILITY.md) for the implemented compatibility surface.
