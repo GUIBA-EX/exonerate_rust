@@ -70,7 +70,10 @@ fn help_and_version_aliases_are_available_without_fasta_inputs() {
     }
     for argument in ["-v", "--version"] {
         let output = run(&[argument]);
-        assert_eq!(output, "exonerate-rs 0.1.0\n");
+        assert_eq!(
+            output,
+            format!("exonerate-rs {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
 
