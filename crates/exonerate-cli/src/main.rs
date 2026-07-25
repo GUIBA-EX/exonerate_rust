@@ -1,5 +1,5 @@
 use exonerate_core::{
-    Alignment, HeuristicConfig, IntronScoring, Model, RawStep, Scoring, Sequence, Strand,
+    Alignment, HeuristicConfig, IntronScoring, Model, Op, RawStep, Scoring, Sequence, Strand,
     align_cdna_to_genome_database_heuristic, align_cdna_to_genome_database_suboptimal,
     align_cdna_to_genome_database_with_dp_memory_stranded,
     align_coding_to_genome_database_heuristic, align_coding_to_genome_database_suboptimal,
@@ -25,9 +25,12 @@ use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
+use std::thread;
 
 fn usage() -> &'static str {
-    "Usage: exonerate-rs [--shorthelp|--help] [--version] [-V N|--verbose N] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
+    "Usage: exonerate-rs [--shorthelp|--help] [--version] [-V N|--verbose N] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--query-id ID] [--target-id ID] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [--result-tsv FILE] [--evidence-gff3 FILE] [--audit protein-candidate] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nBatch: exonerate-rs --tasks TASKS.tsv --result-tsv FILE [--evidence-gff3 FILE] [--threads N] [COMMON OPTIONS]\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
 }
 
 fn version() -> String {
@@ -1057,6 +1060,525 @@ fn write_stdout(text: &str, newline: bool) -> Result<(), String> {
     }
 }
 
+fn tsv_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| match character {
+            '\t' | '\n' | '\r' => ' ',
+            character => character,
+        })
+        .collect()
+}
+
+const RESULT_TSV_HEADER: &str = "task_id\tstatus\tmodel\trank\tquery_id\ttarget_id\tquery_start\tquery_end\tquery_strand\ttarget_start\ttarget_end\ttarget_strand\tscore\tquery_length\ttarget_length\tquery_aligned\ttarget_aligned\tquery_coverage\ttarget_coverage\tquery_gap_bases\ttarget_gap_bases\tframeshift_bases\tintron_count";
+
+fn gff3_field(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b';' | b'=' | b'&' | b',' | b'%' | b'\t' | b'\n' | b'\r' => {
+                format!("%{byte:02X}").bytes().collect::<Vec<_>>()
+            }
+            _ => vec![byte],
+        })
+        .map(char::from)
+        .collect()
+}
+
+fn alignment_metrics(alignment: &Alignment) -> (u64, u64, u64, u64, u64, u64) {
+    let mut query_aligned = 0_u64;
+    let mut target_aligned = 0_u64;
+    let mut query_gap_bases = 0_u64;
+    let mut target_gap_bases = 0_u64;
+    let mut frameshift_bases = 0_u64;
+    let mut intron_count = 0_u64;
+    for run in &alignment.trace {
+        let query_advance = u64::from(run.query_advance) * run.repeats;
+        let target_advance = u64::from(run.target_advance) * run.repeats;
+        query_aligned += query_advance;
+        target_aligned += target_advance;
+        if target_advance == 0 {
+            query_gap_bases += query_advance;
+        }
+        if query_advance == 0 {
+            target_gap_bases += target_advance;
+        }
+        if run.op == Op::Frameshift {
+            frameshift_bases += query_advance.max(target_advance);
+        }
+        if run.op == Op::Intron {
+            intron_count += run.repeats;
+        }
+    }
+    (
+        query_aligned,
+        target_aligned,
+        query_gap_bases,
+        target_gap_bases,
+        frameshift_bases,
+        intron_count,
+    )
+}
+
+fn alignment_rank(alignments: &[Alignment], index: usize, best_n: Option<usize>) -> usize {
+    if best_n.is_none() {
+        return 0;
+    }
+    alignments[..=index]
+        .iter()
+        .filter(|alignment| alignment.query_id == alignments[index].query_id)
+        .count()
+}
+
+fn write_result_tsv(
+    path: &str,
+    alignments: &[Alignment],
+    queries: &[Sequence],
+    targets: &[Sequence],
+    model: &str,
+    task_id: Option<&str>,
+    best_n: Option<usize>,
+) -> Result<(), String> {
+    let file =
+        File::create(path).map_err(|error| format!("create result TSV {path:?}: {error}"))?;
+    let mut output = io::BufWriter::new(file);
+    writeln!(output, "{RESULT_TSV_HEADER}").map_err(|error| error.to_string())?;
+    if alignments.is_empty() {
+        let query_id = queries.first().map_or("", |sequence| sequence.id.as_str());
+        let target_id = targets.first().map_or("", |sequence| sequence.id.as_str());
+        writeln!(
+            output,
+            "{}\tno_hit\t{}\t0\t{}\t{}\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t",
+            tsv_field(task_id.unwrap_or("")),
+            tsv_field(model),
+            tsv_field(query_id),
+            tsv_field(target_id),
+        )
+        .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    for (index, alignment) in alignments.iter().enumerate() {
+        let query_length = queries
+            .iter()
+            .find(|sequence| sequence.id == alignment.query_id)
+            .map_or(0, |sequence| sequence.bases.len() as u64);
+        let target_length = targets
+            .iter()
+            .find(|sequence| sequence.id == alignment.target_id)
+            .map_or(0, |sequence| sequence.bases.len() as u64);
+        let (
+            query_aligned,
+            target_aligned,
+            query_gap_bases,
+            target_gap_bases,
+            frameshift_bases,
+            intron_count,
+        ) = alignment_metrics(alignment);
+        let query_coverage = if query_length == 0 {
+            0.0
+        } else {
+            query_aligned as f64 / query_length as f64
+        };
+        let target_coverage = if target_length == 0 {
+            0.0
+        } else {
+            target_aligned as f64 / target_length as f64
+        };
+        writeln!(
+            output,
+            "{}\taligned\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{query_coverage:.6}\t{target_coverage:.6}\t{}\t{}\t{}\t{}",
+            tsv_field(task_id.unwrap_or("")),
+            tsv_field(model),
+            alignment_rank(alignments, index, best_n),
+            tsv_field(&alignment.query_id),
+            tsv_field(&alignment.target_id),
+            alignment.query_start,
+            alignment.query_end,
+            alignment.query_strand.symbol(),
+            alignment.target_start,
+            alignment.target_end,
+            alignment.target_strand.symbol(),
+            alignment.score,
+            query_length,
+            target_length,
+            query_aligned,
+            target_aligned,
+            query_gap_bases,
+            target_gap_bases,
+            frameshift_bases,
+            intron_count,
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn evidence_gff3(alignment: &Alignment, id: &str, task_id: Option<&str>, rank: usize) -> String {
+    let (query_aligned, target_aligned, _, _, frameshift_bases, intron_count) =
+        alignment_metrics(alignment);
+    let (start, end) = if alignment.target_start <= alignment.target_end {
+        (alignment.target_start + 1, alignment.target_end)
+    } else {
+        (alignment.target_end + 1, alignment.target_start)
+    };
+    let task_attribute = task_id
+        .filter(|task| !task.is_empty())
+        .map(|task| format!(";Task={}", gff3_field(task)))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "{}\texonerate-rs\tmatch\t{}\t{}\t{}\t{}\t.\tID={};Target={} {} {}{};Rank={};QueryAligned={};TargetAligned={};FrameshiftBases={};IntronCount={}",
+        gff3_field(&alignment.target_id),
+        start,
+        end,
+        alignment.score,
+        alignment.target_strand.symbol(),
+        gff3_field(id),
+        gff3_field(&alignment.query_id),
+        alignment.query_start + 1,
+        alignment.query_end,
+        task_attribute,
+        rank,
+        query_aligned,
+        target_aligned,
+        frameshift_bases,
+        intron_count,
+    )];
+    let mut query = alignment.query_start;
+    let mut target = if alignment.target_strand == Strand::Reverse {
+        alignment.target_start.max(alignment.target_end)
+    } else {
+        alignment.target_start.min(alignment.target_end)
+    };
+    let mut part = 0_u64;
+    for run in &alignment.trace {
+        let query_advance = u64::from(run.query_advance) * run.repeats;
+        let target_advance = u64::from(run.target_advance) * run.repeats;
+        if query_advance > 0 && target_advance > 0 {
+            part += 1;
+            let (left, right) = if alignment.target_strand == Strand::Reverse {
+                (target.saturating_sub(target_advance) + 1, target)
+            } else {
+                (target + 1, target + target_advance)
+            };
+            lines.push(format!(
+                "{}\texonerate-rs\tmatch_part\t{}\t{}\t.\t{}\t.\tID={}.part{};Parent={};Target={} {} {}",
+                gff3_field(&alignment.target_id),
+                left.min(right),
+                left.max(right),
+                alignment.target_strand.symbol(),
+                gff3_field(id),
+                part,
+                gff3_field(id),
+                gff3_field(&alignment.query_id),
+                query + 1,
+                query + query_advance,
+            ));
+        }
+        query += query_advance;
+        target = if alignment.target_strand == Strand::Reverse {
+            target.saturating_sub(target_advance)
+        } else {
+            target + target_advance
+        };
+    }
+    lines.join("\n")
+}
+
+fn write_evidence_gff3(
+    path: &str,
+    alignments: &[Alignment],
+    task_id: Option<&str>,
+    best_n: Option<usize>,
+) -> Result<(), String> {
+    let file =
+        File::create(path).map_err(|error| format!("create evidence GFF3 {path:?}: {error}"))?;
+    let mut output = io::BufWriter::new(file);
+    writeln!(output, "##gff-version 3").map_err(|error| error.to_string())?;
+    for (index, alignment) in alignments.iter().enumerate() {
+        let rank = alignment_rank(alignments, index, best_n);
+        let id = format!(
+            "alignment.{}.{}.{}",
+            gff3_field(task_id.unwrap_or("alignment")),
+            gff3_field(&alignment.target_id),
+            index + 1,
+        );
+        writeln!(output, "{}", evidence_gff3(alignment, &id, task_id, rank))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct Task {
+    id: String,
+    model: String,
+    query_fasta: String,
+    query_id: String,
+    target_fasta: String,
+    target_id: String,
+}
+
+fn read_tasks(path: &str) -> Result<Vec<Task>, String> {
+    let file = File::open(path).map_err(|error| format!("open task manifest {path:?}: {error}"))?;
+    let mut tasks = Vec::new();
+    let mut header_seen = false;
+    for (line_number, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| format!("read task manifest {path:?}: {error}"))?;
+        if line.trim().is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if !header_seen {
+            if fields.as_slice()
+                != [
+                    "task_id",
+                    "model",
+                    "query_fasta",
+                    "query_id",
+                    "target_fasta",
+                    "target_id",
+                ]
+            {
+                return Err(format!(
+                    "task manifest {path:?} line {} must use header: task_id\\tmodel\\tquery_fasta\\tquery_id\\ttarget_fasta\\ttarget_id",
+                    line_number + 1
+                ));
+            }
+            header_seen = true;
+            continue;
+        }
+        if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+            return Err(format!(
+                "task manifest {path:?} line {} must contain six non-empty tab-separated fields",
+                line_number + 1
+            ));
+        }
+        tasks.push(Task {
+            id: fields[0].to_owned(),
+            model: fields[1].to_owned(),
+            query_fasta: fields[2].to_owned(),
+            query_id: fields[3].to_owned(),
+            target_fasta: fields[4].to_owned(),
+            target_id: fields[5].to_owned(),
+        });
+    }
+    if !header_seen {
+        return Err(format!("task manifest {path:?} has no header"));
+    }
+    if tasks.is_empty() {
+        return Err(format!("task manifest {path:?} contains no tasks"));
+    }
+    Ok(tasks)
+}
+
+struct BatchResult {
+    index: usize,
+    rows: Vec<String>,
+    gff3: String,
+}
+
+fn run_task_batch(command_args: &[String]) -> Result<(), String> {
+    let mut task_path = None;
+    let mut result_path = None;
+    let mut evidence_path = None;
+    let mut threads = 1_usize;
+    let mut common_args = Vec::new();
+    let mut index = 1;
+    while index < command_args.len() {
+        match command_args[index].as_str() {
+            "--tasks" => {
+                index += 1;
+                task_path = Some(
+                    command_args
+                        .get(index)
+                        .ok_or("missing task manifest path")?
+                        .clone(),
+                );
+            }
+            "--result-tsv" => {
+                index += 1;
+                result_path = Some(
+                    command_args
+                        .get(index)
+                        .ok_or("missing result TSV path")?
+                        .clone(),
+                );
+            }
+            "--evidence-gff3" => {
+                index += 1;
+                evidence_path = Some(
+                    command_args
+                        .get(index)
+                        .ok_or("missing evidence GFF3 path")?
+                        .clone(),
+                );
+            }
+            "--threads" => {
+                index += 1;
+                threads = command_args
+                    .get(index)
+                    .ok_or("missing thread count")?
+                    .parse()
+                    .map_err(|_| "invalid thread count")?;
+                if threads == 0 {
+                    return Err("thread count must be positive".into());
+                }
+            }
+            "-m" | "--model" | "-q" | "--query" | "-t" | "--target" | "--query-id"
+            | "--target-id" | "--task-id" => {
+                return Err(format!(
+                    "{} is supplied by every task-manifest row and cannot be a batch-wide option",
+                    command_args[index]
+                ));
+            }
+            _ => common_args.push(command_args[index].clone()),
+        }
+        index += 1;
+    }
+    let task_path = task_path.ok_or("--tasks requires a manifest path")?;
+    let result_path = result_path.ok_or("--tasks requires --result-tsv FILE")?;
+    let tasks = Arc::new(read_tasks(&task_path)?);
+    let temporary = std::env::temp_dir().join(format!(
+        "exonerate-rs-tasks-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_nanos()
+    ));
+    fs::create_dir(&temporary)
+        .map_err(|error| format!("create batch temporary directory: {error}"))?;
+    let executable =
+        std::env::current_exe().map_err(|error| format!("locate executable: {error}"))?;
+    let write_evidence = evidence_path.is_some();
+    let next = Arc::new(AtomicUsize::new(0));
+    let (sender, receiver) = mpsc::channel();
+    let worker_count = threads.min(tasks.len());
+    for _ in 0..worker_count {
+        let sender = sender.clone();
+        let next = Arc::clone(&next);
+        let tasks = Arc::clone(&tasks);
+        let temporary = temporary.clone();
+        let executable = executable.clone();
+        let common_args = common_args.clone();
+        thread::spawn(move || {
+            loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some(task) = tasks.get(index) else { break };
+                let result_file = temporary.join(format!("{index}.tsv"));
+                let gff_file = temporary.join(format!("{index}.gff3"));
+                let mut args = common_args.clone();
+                args.extend([
+                    "--model".to_owned(),
+                    task.model.clone(),
+                    "--query".to_owned(),
+                    task.query_fasta.clone(),
+                    "--target".to_owned(),
+                    task.target_fasta.clone(),
+                    "--query-id".to_owned(),
+                    task.query_id.clone(),
+                    "--target-id".to_owned(),
+                    task.target_id.clone(),
+                    "--task-id".to_owned(),
+                    task.id.clone(),
+                    "--result-tsv".to_owned(),
+                    result_file.to_string_lossy().into_owned(),
+                    "--verbose".to_owned(),
+                    "0".to_owned(),
+                    "--showalignment".to_owned(),
+                    "no".to_owned(),
+                    "--showsugar".to_owned(),
+                    "no".to_owned(),
+                    "--showcigar".to_owned(),
+                    "no".to_owned(),
+                    "--showvulgar".to_owned(),
+                    "no".to_owned(),
+                    "--showgff".to_owned(),
+                    "no".to_owned(),
+                    "--showquerygff".to_owned(),
+                    "no".to_owned(),
+                ]);
+                if write_evidence {
+                    args.extend([
+                        "--evidence-gff3".to_owned(),
+                        gff_file.to_string_lossy().into_owned(),
+                    ]);
+                }
+                let execution = Command::new(&executable).args(&args).output();
+                let (rows, gff3) = match execution {
+                    Ok(output) if output.status.success() => {
+                        let rows = fs::read_to_string(&result_file)
+                        .map(|text| text.lines().skip(1).map(str::to_owned).collect())
+                        .unwrap_or_else(|error| {
+                            vec![format!(
+                                "{}\tfailed\t{}\t0\t{}\t{}\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t{}",
+                                tsv_field(&task.id),
+                                tsv_field(&task.model),
+                                tsv_field(&task.query_id),
+                                tsv_field(&task.target_id),
+                                tsv_field(&format!("result read failed: {error}"))
+                            )]
+                        });
+                        let gff3 = fs::read_to_string(&gff_file)
+                            .map(|text| text.lines().skip(1).collect::<Vec<_>>().join("\n"))
+                            .unwrap_or_default();
+                        (rows, gff3)
+                    }
+                    Ok(output) => (
+                        vec![format!(
+                            "{}\tfailed\t{}\t0\t{}\t{}\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t{}",
+                            tsv_field(&task.id),
+                            tsv_field(&task.model),
+                            tsv_field(&task.query_id),
+                            tsv_field(&task.target_id),
+                            tsv_field(&String::from_utf8_lossy(&output.stderr))
+                        )],
+                        String::new(),
+                    ),
+                    Err(error) => (
+                        vec![format!(
+                            "{}\tfailed\t{}\t0\t{}\t{}\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t{}",
+                            tsv_field(&task.id),
+                            tsv_field(&task.model),
+                            tsv_field(&task.query_id),
+                            tsv_field(&task.target_id),
+                            tsv_field(&error.to_string())
+                        )],
+                        String::new(),
+                    ),
+                };
+                let _ = sender.send(BatchResult { index, rows, gff3 });
+            }
+        });
+    }
+    drop(sender);
+    let mut results = receiver.into_iter().collect::<Vec<_>>();
+    results.sort_by_key(|result| result.index);
+    let file = File::create(&result_path)
+        .map_err(|error| format!("create batch result TSV {result_path:?}: {error}"))?;
+    let mut output = io::BufWriter::new(file);
+    writeln!(output, "{RESULT_TSV_HEADER}\terror").map_err(|error| error.to_string())?;
+    for result in &results {
+        for row in &result.rows {
+            writeln!(output, "{row}\t").map_err(|error| error.to_string())?;
+        }
+    }
+    if let Some(path) = evidence_path {
+        let file = File::create(&path)
+            .map_err(|error| format!("create batch evidence GFF3 {path:?}: {error}"))?;
+        let mut output = io::BufWriter::new(file);
+        writeln!(output, "##gff-version 3").map_err(|error| error.to_string())?;
+        for result in &results {
+            if !result.gff3.is_empty() {
+                writeln!(output, "{}", result.gff3).map_err(|error| error.to_string())?;
+            }
+        }
+    }
+    fs::remove_dir_all(&temporary)
+        .map_err(|error| format!("remove batch temporary directory: {error}"))?;
+    Ok(())
+}
+
 fn pretty_alignment(
     alignment: &Alignment,
     query: &Sequence,
@@ -1096,6 +1618,9 @@ fn main() -> ExitCode {
 }
 fn run() -> Result<(), String> {
     let command_args: Vec<_> = std::env::args().collect();
+    if command_args.iter().any(|argument| argument == "--tasks") {
+        return run_task_batch(&command_args);
+    }
     let command_line = command_args.join(" ");
     let mut args = command_args.into_iter().skip(1).peekable();
     let mut model = Model::Ungapped;
@@ -1128,6 +1653,12 @@ fn run() -> Result<(), String> {
     let mut best_n: Option<usize> = None;
     let mut ryo: Option<String> = None;
     let (mut query_file, mut target_file): (Option<String>, Option<String>) = (None, None);
+    let (mut query_record_id, mut target_record_id): (Option<String>, Option<String>) =
+        (None, None);
+    let mut task_id: Option<String> = None;
+    let mut result_tsv: Option<String> = None;
+    let mut evidence_gff3: Option<String> = None;
+    let mut audit: Option<String> = None;
     let mut show_alignment = false;
     let mut subopt = true;
     let mut exhaustive = false;
@@ -1310,6 +1841,16 @@ fn run() -> Result<(), String> {
             }
             "-q" | "--query" => query_file = Some(args.next().ok_or("missing query path")?),
             "-t" | "--target" => target_file = Some(args.next().ok_or("missing target path")?),
+            "--query-id" => query_record_id = Some(args.next().ok_or("missing query record ID")?),
+            "--target-id" => {
+                target_record_id = Some(args.next().ok_or("missing target record ID")?)
+            }
+            "--task-id" => task_id = Some(args.next().ok_or("missing task ID")?),
+            "--result-tsv" => result_tsv = Some(args.next().ok_or("missing result TSV path")?),
+            "--evidence-gff3" => {
+                evidence_gff3 = Some(args.next().ok_or("missing evidence GFF3 path")?)
+            }
+            "--audit" => audit = Some(args.next().ok_or("missing audit profile")?),
             "-Q" | "--querytype" => {
                 query_type = args.next().ok_or("missing query type")?;
                 query_type_explicit = true;
@@ -1472,18 +2013,36 @@ fn run() -> Result<(), String> {
             model_name.as_str(),
             "protein2dna" | "p2d" | "protein2dna:bestfit" | "p2d:b"
         );
-    let q = fasta_chunk(
+    let mut q = fasta_chunk(
         &files[0],
         read_fasta(&files[0]).map_err(|e| e.to_string())?,
         query_chunk_id,
         query_chunk_total,
     )?;
-    let t = fasta_chunk(
+    let mut t = fasta_chunk(
         &files[1],
         read_fasta(&files[1]).map_err(|e| e.to_string())?,
         target_chunk_id,
         target_chunk_total,
     )?;
+    if let Some(id) = &query_record_id {
+        q.retain(|sequence| sequence.id == *id);
+        if q.is_empty() {
+            return Err(format!(
+                "query record {id:?} was not found in {:?}",
+                files[0]
+            ));
+        }
+    }
+    if let Some(id) = &target_record_id {
+        t.retain(|sequence| sequence.id == *id);
+        if t.is_empty() {
+            return Err(format!(
+                "target record {id:?} was not found in {:?}",
+                files[1]
+            ));
+        }
+    }
     if !query_type_explicit && !requires_dna_pair && !requires_protein_to_dna {
         query_type = if q
             .iter()
@@ -1513,6 +2072,27 @@ fn run() -> Result<(), String> {
         return Err(format!(
             "model {model_name} requires a protein query and DNA target"
         ));
+    }
+    if let Some(profile) = audit.as_deref() {
+        if profile != "protein-candidate" {
+            return Err(format!("unknown audit profile {profile:?}"));
+        }
+        if !requires_protein_to_dna {
+            return Err("--audit protein-candidate requires protein2dna or protein2genome".into());
+        }
+        if result_tsv.is_none() {
+            return Err("--audit protein-candidate requires --result-tsv FILE".into());
+        }
+        verbosity = 0;
+        show_alignment = false;
+        sugar = false;
+        cigar = false;
+        vulgar = false;
+        gff = false;
+        query_gff = false;
+        subopt = false;
+        exhaustive = true;
+        min_score = Some(0);
     }
     if verbosity > 0 {
         let hostname = system_hostname();
@@ -1913,6 +2493,20 @@ fn run() -> Result<(), String> {
         };
         format!("{base}:{query_type}2{target_type}")
     };
+    if let Some(path) = &result_tsv {
+        write_result_tsv(
+            path,
+            &alignments,
+            &q,
+            &t,
+            &report_model,
+            task_id.as_deref(),
+            best_n,
+        )?;
+    }
+    if let Some(path) = &evidence_gff3 {
+        write_evidence_gff3(path, &alignments, task_id.as_deref(), best_n)?;
+    }
     let mut output_ranks: HashMap<String, usize> = HashMap::new();
     for a in alignments {
         let rank = output_ranks.entry(a.query_id.clone()).or_default();

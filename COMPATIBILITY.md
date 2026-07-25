@@ -1,30 +1,19 @@
 # 兼容范围
 
-行为基准为仓库中的 Exonerate 2.4.0：
-`upstream/src/program/exonerate`。
+行为基准为仓库内的 Exonerate 2.4.0（`upstream/src/program/exonerate`）。
 
-| 范围 | 状态 |
+| 范围 | 支持 |
 | --- | --- |
-| FASTA、多记录和分块读取 | 已实现 |
-| DNA IUPAC 与蛋白质 BLOSUM62 打分 | 已实现 |
-| 16 个 CLI 模型及短别名 | 已实现 |
-| 正反链、正向参考坐标与反向坐标模式 | 已实现 |
-| intron、phase、split codon、frameshift | 已实现 |
-| sugar、cigar、vulgar、pretty alignment | 已实现 |
-| 常用 RYO 与原子 `%P` 转移 | 已实现并有 upstream 基准 |
-| `--subopt` 与 `--bestn` | 16 个 CLI 模型及 affine scopes 已实现 |
-| 启发式搜索与 `--exhaustive` | 已实现 |
-| `--dpmemory` checkpoint traceback | 专用模型与通用 C4 长状态均已实现 |
-| verbose header/footer | 默认值、signed level 和 hostname 与 upstream 对齐 |
-| GFF3 | 项目格式，已实现 |
-| GFF2 | 不在范围内 |
+| 输入 | FASTA、多记录、分块读取 |
+| 模型 | 16 个 CLI 模型及短别名 |
+| 比对 | DNA IUPAC、BLOSUM62、intron、phase、split codon、frameshift |
+| 坐标 | 正反链、正向参考坐标与反向坐标模式 |
+| 输出 | sugar、cigar、vulgar、pretty、RYO（含原子 `%P`）、GFF3 |
+| 搜索 | 启发式、`--exhaustive`、`--subopt`、`--bestn` |
+| 内存 | 专用模型与通用 C4 的 checkpoint traceback |
+| CLI | upstream 风格的 verbose、header/footer 与 hostname |
 
-“已实现”表示存在可执行路径和回归测试，不等于所有参数组合均已证明
-逐字节兼容。精确证据见 [命令行基准覆盖](ORACLE_MATRIX.md)。
+GFF2 不在范围内。
 
-兼容性优先级依次为：
-
-1. 得分与 traceback 路径；
-2. 坐标、链方向和排序；
-3. sugar/cigar/vulgar/RYO；
-4. 错误、header/footer 等 CLI 外围行为。
+兼容性优先保证得分与 traceback，其次是坐标、排序和报告格式。表中“支持”
+表示存在执行路径和回归测试；逐项证据见[命令行基准覆盖](ORACLE_MATRIX.md)。
