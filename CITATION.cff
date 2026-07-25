@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "exonerate-rs: a Rust reimplementation of Exonerate"
+version: 0.1.0
+date-released: 2026-07-26
+authors:
+  - family-names: Xia
+    given-names: Fei
+  - family-names: Tang
+    given-names: Zizhen
+repository-code: "https://github.com/GUIBA-EX/exonerate_rust"
+license: GPL-3.0-only
