@@ -1,4 +1,4 @@
-# exonerate-rs
+# exonerate-rust
 
 [![CI](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml)
 
