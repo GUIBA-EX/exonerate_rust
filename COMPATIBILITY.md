@@ -11,10 +11,11 @@
 | 正反链、正向参考坐标与反向坐标模式 | 已实现 |
 | intron、phase、split codon、frameshift | 已实现 |
 | sugar、cigar、vulgar、pretty alignment | 已实现 |
-| 常用 RYO 与原子 `%P` 转移 | 已实现，仍在扩充基准 |
-| `--subopt` 与 `--bestn` | 主要模型已实现；部分 affine scope 待补 |
+| 常用 RYO 与原子 `%P` 转移 | 已实现并有 upstream 基准 |
+| `--subopt` 与 `--bestn` | 16 个 CLI 模型及 affine scopes 已实现 |
 | 启发式搜索与 `--exhaustive` | 已实现 |
-| `--dpmemory` checkpoint traceback | 主要模型已实现 |
+| `--dpmemory` checkpoint traceback | 专用模型与通用 C4 长状态均已实现 |
+| verbose header/footer | 默认值、signed level 和 hostname 与 upstream 对齐 |
 | GFF3 | 项目格式，已实现 |
 | GFF2 | 不在范围内 |
 

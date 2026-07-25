@@ -70,7 +70,7 @@ pub mod model {
             open: Score,
         },
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct Transition {
         pub from: StateId,
         pub to: StateId,
@@ -79,7 +79,7 @@ pub mod model {
         pub kernel: ScoreKernel,
         pub label: Label,
     }
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct ModelIr {
         pub scope: Scope,
         pub tie_policy: TiePolicy,
@@ -1823,8 +1823,21 @@ fn state_from_rank(rank: u8) -> State {
 pub enum ExecutionError {
     InvalidModel(model::ModelError),
     UnsupportedKernel(model::ScoreKernel),
-    UnsupportedCodonAdvance { query: u32, target: u32 },
+    UnsupportedCodonAdvance {
+        query: u32,
+        target: u32,
+    },
     TooManyTransitions(usize),
+    AllocationOverflow,
+    AllocationFailed {
+        slots: usize,
+    },
+    /// A caller explicitly required full generic traceback tables that exceed
+    /// its DP planning budget.
+    MemoryLimitExceeded {
+        required_bytes: u128,
+        limit_bytes: u128,
+    },
 }
 impl fmt::Display for ExecutionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1840,6 +1853,20 @@ impl fmt::Display for ExecutionError {
                     "model has {count} transitions; traceback IDs are limited to 65535"
                 )
             }
+            Self::AllocationOverflow => write!(f, "generic DP table size overflows usize"),
+            Self::AllocationFailed { slots } => {
+                write!(
+                    f,
+                    "unable to allocate generic DP tables for {slots} state slots"
+                )
+            }
+            Self::MemoryLimitExceeded {
+                required_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "generic C4 traceback needs at least {required_bytes} bytes, exceeding the requested DP budget of {limit_bytes} bytes"
+            ),
         }
     }
 }
@@ -1890,6 +1917,55 @@ struct GenericParent {
     target: usize,
     fragment: TraceFragment,
     raw_fragment: RawFragment,
+}
+
+/// Per-cell state transported through epsilon edges.
+///
+/// Phase transitions need the coordinate immediately before their prior
+/// non-epsilon transition.  Keeping it independently of parent storage is
+/// the generic equivalent of C4's cell shadow and makes it possible to carry
+/// a boundary cell into a future checkpoint continuation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GenericCellShadow {
+    phase_donor: Option<(usize, usize)>,
+}
+
+/// Persistent long-state state at a generic C4 row boundary.
+///
+/// Reduced-space checkpoints copy this as one unit together with score rows
+/// and [`GenericCellShadow`]s. Keeping all three queue families here prevents
+/// replay from accidentally restoring only one intron/NER flavour.
+#[derive(Clone)]
+struct GenericLongStatePayload {
+    ner_columns: Vec<Vec<JointIntronWindow>>,
+    joint_columns: Vec<Vec<JointIntronWindow>>,
+    query_windows: Vec<Vec<IntronCandidateWindow>>,
+}
+impl GenericLongStatePayload {
+    fn try_allocate(
+        ner_count: usize,
+        joint_count: usize,
+        query_count: usize,
+        columns: usize,
+    ) -> Result<Self, ExecutionError> {
+        Ok(Self {
+            ner_columns: try_allocate_generic_columns(
+                ner_count,
+                columns,
+                JointIntronWindow::default(),
+            )?,
+            joint_columns: try_allocate_generic_columns(
+                joint_count,
+                columns,
+                JointIntronWindow::default(),
+            )?,
+            query_windows: try_allocate_generic_columns(
+                query_count,
+                columns,
+                IntronCandidateWindow::default(),
+            )?,
+        })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2267,6 +2343,856 @@ fn generic_op(edge: &model::Transition) -> Option<Op> {
     }
 }
 
+fn try_allocate_generic_table<T: Clone>(
+    slots: usize,
+    initial: T,
+) -> Result<Vec<T>, ExecutionError> {
+    let mut table = Vec::new();
+    table
+        .try_reserve_exact(slots)
+        .map_err(|_| ExecutionError::AllocationFailed { slots })?;
+    table.resize(slots, initial);
+    Ok(table)
+}
+
+fn try_allocate_generic_columns<T: Clone>(
+    rows: usize,
+    columns: usize,
+    initial: T,
+) -> Result<Vec<Vec<T>>, ExecutionError> {
+    let mut result = Vec::new();
+    result
+        .try_reserve_exact(rows)
+        .map_err(|_| ExecutionError::AllocationFailed { slots: rows })?;
+    for _ in 0..rows {
+        result.push(try_allocate_generic_table(columns, initial.clone())?);
+    }
+    Ok(result)
+}
+
+fn generic_table_slots(
+    query_len: usize,
+    target_len: usize,
+    states: usize,
+) -> Result<usize, ExecutionError> {
+    let rows = query_len
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let columns = target_len
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    rows.checked_mul(columns)
+        .and_then(|cells| cells.checked_mul(states))
+        .ok_or(ExecutionError::AllocationOverflow)
+}
+
+/// Score storage used by the generic C4 kernel.
+///
+/// Full traceback owns every query row. Reduced-space forward execution uses
+/// the same coordinate API with a bounded row ring; callers are responsible
+/// for retaining enough history for every finite and delayed long-state edge.
+struct GenericScoreMatrix {
+    data: Vec<Score>,
+    row_tags: Vec<Option<usize>>,
+    columns: usize,
+    states: usize,
+    row_capacity: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenericScoreCheckpointRow {
+    row: usize,
+    scores: Vec<Score>,
+}
+
+impl GenericScoreMatrix {
+    fn full(query_len: usize, target_len: usize, states: usize) -> Result<Self, ExecutionError> {
+        let columns = target_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let row_capacity = query_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let slots = generic_table_slots(query_len, target_len, states)?;
+        let mut row_tags = try_allocate_generic_table(row_capacity, None)?;
+        for (row, tag) in row_tags.iter_mut().enumerate() {
+            *tag = Some(row);
+        }
+        Ok(Self {
+            data: try_allocate_generic_table(slots, NEG_INF)?,
+            row_tags,
+            columns,
+            states,
+            row_capacity,
+        })
+    }
+
+    #[allow(dead_code)] // consumed by generic checkpoint forward/replay
+    fn rolling(
+        target_len: usize,
+        states: usize,
+        row_capacity: usize,
+    ) -> Result<Self, ExecutionError> {
+        if row_capacity == 0 {
+            return Err(ExecutionError::AllocationOverflow);
+        }
+        let columns = target_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let slots = row_capacity
+            .checked_mul(columns)
+            .and_then(|cells| cells.checked_mul(states))
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        Ok(Self {
+            data: try_allocate_generic_table(slots, NEG_INF)?,
+            row_tags: try_allocate_generic_table(row_capacity, None)?,
+            columns,
+            states,
+            row_capacity,
+        })
+    }
+
+    fn index(&self, row: usize, column: usize, state: model::StateId) -> usize {
+        ((row % self.row_capacity) * self.columns + column) * self.states + state as usize
+    }
+
+    fn get(&self, row: usize, column: usize, state: model::StateId) -> Score {
+        if self.row_tags[row % self.row_capacity] == Some(row) {
+            self.data[self.index(row, column, state)]
+        } else {
+            NEG_INF
+        }
+    }
+
+    fn set(&mut self, row: usize, column: usize, state: model::StateId, score: Score) {
+        self.prepare_row(row);
+        let index = self.index(row, column, state);
+        self.data[index] = score;
+    }
+
+    #[allow(dead_code)] // consumed by generic checkpoint forward/replay
+    fn clear_row(&mut self, row: usize) {
+        let first = (row % self.row_capacity) * self.columns * self.states;
+        self.data[first..first + self.columns * self.states].fill(NEG_INF);
+        self.row_tags[row % self.row_capacity] = Some(row);
+    }
+
+    fn prepare_row(&mut self, row: usize) {
+        if self.row_tags[row % self.row_capacity] != Some(row) {
+            self.clear_row(row);
+        }
+    }
+
+    fn checkpoint_row(&self, row: usize) -> Result<GenericScoreCheckpointRow, ExecutionError> {
+        let first = (row % self.row_capacity) * self.columns * self.states;
+        let slots = self.columns * self.states;
+        let mut scores = try_allocate_generic_table(slots, NEG_INF)?;
+        if self.row_tags[row % self.row_capacity] == Some(row) {
+            scores.copy_from_slice(&self.data[first..first + slots]);
+        }
+        Ok(GenericScoreCheckpointRow { row, scores })
+    }
+
+    fn restore_row(&mut self, checkpoint: &GenericScoreCheckpointRow) {
+        debug_assert_eq!(checkpoint.scores.len(), self.columns * self.states);
+        self.prepare_row(checkpoint.row);
+        let first = (checkpoint.row % self.row_capacity) * self.columns * self.states;
+        self.data[first..first + checkpoint.scores.len()].copy_from_slice(&checkpoint.scores);
+    }
+}
+
+/// Phase-shadow storage with the same full/ring row semantics as
+/// [`GenericScoreMatrix`].
+struct GenericShadowMatrix {
+    data: Vec<GenericCellShadow>,
+    row_tags: Vec<Option<usize>>,
+    columns: usize,
+    states: usize,
+    row_capacity: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenericShadowCheckpointRow {
+    row: usize,
+    shadows: Vec<GenericCellShadow>,
+}
+
+impl GenericShadowMatrix {
+    fn full(query_len: usize, target_len: usize, states: usize) -> Result<Self, ExecutionError> {
+        let columns = target_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let row_capacity = query_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let slots = generic_table_slots(query_len, target_len, states)?;
+        let mut row_tags = try_allocate_generic_table(row_capacity, None)?;
+        for (row, tag) in row_tags.iter_mut().enumerate() {
+            *tag = Some(row);
+        }
+        Ok(Self {
+            data: try_allocate_generic_table(slots, GenericCellShadow::default())?,
+            row_tags,
+            columns,
+            states,
+            row_capacity,
+        })
+    }
+
+    #[allow(dead_code)] // consumed by generic checkpoint forward/replay
+    fn rolling(
+        target_len: usize,
+        states: usize,
+        row_capacity: usize,
+    ) -> Result<Self, ExecutionError> {
+        if row_capacity == 0 {
+            return Err(ExecutionError::AllocationOverflow);
+        }
+        let columns = target_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let slots = row_capacity
+            .checked_mul(columns)
+            .and_then(|cells| cells.checked_mul(states))
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        Ok(Self {
+            data: try_allocate_generic_table(slots, GenericCellShadow::default())?,
+            row_tags: try_allocate_generic_table(row_capacity, None)?,
+            columns,
+            states,
+            row_capacity,
+        })
+    }
+
+    fn index(&self, row: usize, column: usize, state: model::StateId) -> usize {
+        ((row % self.row_capacity) * self.columns + column) * self.states + state as usize
+    }
+
+    fn get(&self, row: usize, column: usize, state: model::StateId) -> GenericCellShadow {
+        if self.row_tags[row % self.row_capacity] == Some(row) {
+            self.data[self.index(row, column, state)]
+        } else {
+            GenericCellShadow::default()
+        }
+    }
+
+    fn set(&mut self, row: usize, column: usize, state: model::StateId, shadow: GenericCellShadow) {
+        self.prepare_row(row);
+        let index = self.index(row, column, state);
+        self.data[index] = shadow;
+    }
+
+    #[allow(dead_code)] // consumed by generic checkpoint forward/replay
+    fn clear_row(&mut self, row: usize) {
+        let first = (row % self.row_capacity) * self.columns * self.states;
+        self.data[first..first + self.columns * self.states].fill(GenericCellShadow::default());
+        self.row_tags[row % self.row_capacity] = Some(row);
+    }
+
+    fn prepare_row(&mut self, row: usize) {
+        if self.row_tags[row % self.row_capacity] != Some(row) {
+            self.clear_row(row);
+        }
+    }
+
+    fn checkpoint_row(&self, row: usize) -> Result<GenericShadowCheckpointRow, ExecutionError> {
+        let first = (row % self.row_capacity) * self.columns * self.states;
+        let slots = self.columns * self.states;
+        let mut shadows = try_allocate_generic_table(slots, GenericCellShadow::default())?;
+        if self.row_tags[row % self.row_capacity] == Some(row) {
+            shadows.copy_from_slice(&self.data[first..first + slots]);
+        }
+        Ok(GenericShadowCheckpointRow { row, shadows })
+    }
+
+    fn restore_row(&mut self, checkpoint: &GenericShadowCheckpointRow) {
+        debug_assert_eq!(checkpoint.shadows.len(), self.columns * self.states);
+        self.prepare_row(checkpoint.row);
+        let first = (checkpoint.row % self.row_capacity) * self.columns * self.states;
+        self.data[first..first + checkpoint.shadows.len()].copy_from_slice(&checkpoint.shadows);
+    }
+}
+
+/// Self-contained generic C4 row boundary.  Ordinary edges are resumed from
+/// the retained score/shadow history; long NER and intron edges resume from
+/// their live monotonic queues.
+#[allow(dead_code)] // consumed by the generic checkpoint forward/replay path
+#[derive(Clone)]
+struct GenericCheckpoint {
+    row: usize,
+    score_history: Vec<GenericScoreCheckpointRow>,
+    shadow_history: Vec<GenericShadowCheckpointRow>,
+    parent_frontier: Vec<GenericParentCheckpointRow>,
+    long_payload: GenericLongStatePayload,
+}
+
+#[allow(dead_code)] // consumed by the generic checkpoint forward/replay path
+impl GenericCheckpoint {
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        row: usize,
+        past_rows: usize,
+        future_rows: usize,
+        last_row: usize,
+        scores: &GenericScoreMatrix,
+        shadows: &GenericShadowMatrix,
+        parents: &GenericParentMatrix,
+        long_payload: &GenericLongStatePayload,
+    ) -> Result<Self, ExecutionError> {
+        let first_row = row.saturating_sub(past_rows);
+        let final_row = row.saturating_add(future_rows).min(last_row);
+        let mut score_history = Vec::new();
+        let mut shadow_history = Vec::new();
+        let mut parent_frontier = Vec::new();
+        score_history
+            .try_reserve_exact(final_row + 1 - first_row)
+            .map_err(|_| ExecutionError::AllocationFailed {
+                slots: final_row + 1 - first_row,
+            })?;
+        shadow_history
+            .try_reserve_exact(final_row + 1 - first_row)
+            .map_err(|_| ExecutionError::AllocationFailed {
+                slots: final_row + 1 - first_row,
+            })?;
+        parent_frontier
+            .try_reserve_exact(final_row.saturating_sub(row))
+            .map_err(|_| ExecutionError::AllocationFailed {
+                slots: final_row.saturating_sub(row),
+            })?;
+        for history_row in first_row..=final_row {
+            score_history.push(scores.checkpoint_row(history_row)?);
+            shadow_history.push(shadows.checkpoint_row(history_row)?);
+        }
+        for frontier_row in row + 1..=final_row {
+            parent_frontier.push(parents.checkpoint_row(frontier_row)?);
+        }
+        Ok(Self {
+            row,
+            score_history,
+            shadow_history,
+            parent_frontier,
+            long_payload: long_payload.clone(),
+        })
+    }
+
+    fn restore(
+        &self,
+        scores: &mut GenericScoreMatrix,
+        shadows: &mut GenericShadowMatrix,
+        parents: &mut GenericParentMatrix,
+    ) -> GenericLongStatePayload {
+        for row in &self.score_history {
+            scores.restore_row(row);
+        }
+        for row in &self.shadow_history {
+            shadows.restore_row(row);
+        }
+        for row in &self.parent_frontier {
+            parents.restore_row(row);
+        }
+        self.long_payload.clone()
+    }
+}
+
+/// Traceback parent storage for either a complete generic execution or one
+/// checkpoint replay block.
+struct GenericParentMatrix {
+    data: Vec<Option<GenericParent>>,
+    row_tags: Vec<Option<usize>>,
+    columns: usize,
+    states: usize,
+    row_capacity: usize,
+}
+
+#[derive(Clone)]
+struct GenericParentCheckpointRow {
+    row: usize,
+    parents: Vec<Option<GenericParent>>,
+}
+
+impl GenericParentMatrix {
+    fn full(query_len: usize, target_len: usize, states: usize) -> Result<Self, ExecutionError> {
+        let columns = target_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let row_capacity = query_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let slots = generic_table_slots(query_len, target_len, states)?;
+        let mut row_tags = try_allocate_generic_table(row_capacity, None)?;
+        for (row, tag) in row_tags.iter_mut().enumerate() {
+            *tag = Some(row);
+        }
+        Ok(Self {
+            data: try_allocate_generic_table(slots, None)?,
+            row_tags,
+            columns,
+            states,
+            row_capacity,
+        })
+    }
+
+    #[allow(dead_code)] // consumed by generic checkpoint block replay
+    fn rolling(
+        target_len: usize,
+        states: usize,
+        row_capacity: usize,
+    ) -> Result<Self, ExecutionError> {
+        if row_capacity == 0 {
+            return Err(ExecutionError::AllocationOverflow);
+        }
+        let columns = target_len
+            .checked_add(1)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let slots = row_capacity
+            .checked_mul(columns)
+            .and_then(|cells| cells.checked_mul(states))
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        Ok(Self {
+            data: try_allocate_generic_table(slots, None)?,
+            row_tags: try_allocate_generic_table(row_capacity, None)?,
+            columns,
+            states,
+            row_capacity,
+        })
+    }
+
+    fn index(&self, row: usize, column: usize, state: model::StateId) -> usize {
+        ((row % self.row_capacity) * self.columns + column) * self.states + state as usize
+    }
+
+    fn get(&self, row: usize, column: usize, state: model::StateId) -> Option<GenericParent> {
+        if self.row_tags[row % self.row_capacity] == Some(row) {
+            self.data[self.index(row, column, state)]
+        } else {
+            None
+        }
+    }
+
+    fn set(&mut self, row: usize, column: usize, state: model::StateId, parent: GenericParent) {
+        self.prepare_row(row);
+        let index = self.index(row, column, state);
+        self.data[index] = Some(parent);
+    }
+
+    #[allow(dead_code)] // consumed by generic checkpoint block replay
+    fn clear_row(&mut self, row: usize) {
+        let first = (row % self.row_capacity) * self.columns * self.states;
+        self.data[first..first + self.columns * self.states].fill(None);
+        self.row_tags[row % self.row_capacity] = Some(row);
+    }
+
+    fn prepare_row(&mut self, row: usize) {
+        if self.row_tags[row % self.row_capacity] != Some(row) {
+            self.clear_row(row);
+        }
+    }
+
+    fn checkpoint_row(&self, row: usize) -> Result<GenericParentCheckpointRow, ExecutionError> {
+        let first = (row % self.row_capacity) * self.columns * self.states;
+        let slots = self.columns * self.states;
+        let mut parents = try_allocate_generic_table(slots, None)?;
+        if self.row_tags[row % self.row_capacity] == Some(row) {
+            parents.copy_from_slice(&self.data[first..first + slots]);
+        }
+        Ok(GenericParentCheckpointRow { row, parents })
+    }
+
+    fn restore_row(&mut self, checkpoint: &GenericParentCheckpointRow) {
+        debug_assert_eq!(checkpoint.parents.len(), self.columns * self.states);
+        self.prepare_row(checkpoint.row);
+        let first = (checkpoint.row % self.row_capacity) * self.columns * self.states;
+        self.data[first..first + checkpoint.parents.len()].copy_from_slice(&checkpoint.parents);
+    }
+}
+
+/// Conservative planned storage for a complete generic execution.
+///
+/// Besides score/parent tables this includes worst-case capacities of the
+/// monotonic candidate queues owned by compiled NER and intron states.  It
+/// deliberately remains a DP planning estimate rather than an RSS hard cap:
+/// allocator metadata and the returned alignment are process-dependent.
+fn generic_full_dp_bytes(
+    query_len: usize,
+    target_len: usize,
+    ir: &model::ModelIr,
+) -> Result<u128, ExecutionError> {
+    let rows = query_len
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let columns = target_len
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let slots = generic_table_slots(query_len, target_len, ir.state_count as usize)? as u128;
+    let mut bytes = slots
+        .checked_mul(
+            (size_of::<Score>()
+                + size_of::<Option<GenericParent>>()
+                + size_of::<GenericCellShadow>()) as u128,
+        )
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let add = |total: &mut u128, count: u128, item_bytes: usize| -> Result<(), ExecutionError> {
+        *total = total
+            .checked_add(
+                count
+                    .checked_mul(item_bytes as u128)
+                    .ok_or(ExecutionError::AllocationOverflow)?,
+            )
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        Ok(())
+    };
+
+    // A VecDeque grown from empty has capacity at most twice its largest live
+    // length, with an initial four-slot allocation for short queues.
+    let queue_capacity = |length: usize| -> Result<u128, ExecutionError> {
+        length
+            .checked_mul(2)
+            .map(|capacity| capacity.max(4) as u128)
+            .ok_or(ExecutionError::AllocationOverflow)
+    };
+    let target_long_count = target_long_states(ir).len();
+    let ner_long_count = ner_long_states(ir).len();
+    let joint_long_count = joint_long_states(ir).len();
+    let query_long_count = query_long_states(ir).len();
+    let persistent_queue_capacity = queue_capacity(rows)?;
+    let temporary_queue_capacity = queue_capacity(columns)?;
+    let persistent_windows = |count: usize,
+                              candidate_bytes: usize,
+                              window_bytes: usize,
+                              bytes: &mut u128|
+     -> Result<(), ExecutionError> {
+        let windows = (count as u128)
+            .checked_mul(columns as u128)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        add(bytes, windows, window_bytes)?;
+        add(
+            bytes,
+            windows
+                .checked_mul(persistent_queue_capacity)
+                .ok_or(ExecutionError::AllocationOverflow)?,
+            candidate_bytes,
+        )
+    };
+    persistent_windows(
+        ner_long_count,
+        size_of::<JointIntronCandidate>(),
+        size_of::<JointIntronWindow>(),
+        &mut bytes,
+    )?;
+    persistent_windows(
+        joint_long_count,
+        size_of::<JointIntronCandidate>(),
+        size_of::<JointIntronWindow>(),
+        &mut bytes,
+    )?;
+    persistent_windows(
+        query_long_count,
+        size_of::<IntronCandidate>(),
+        size_of::<IntronCandidateWindow>(),
+        &mut bytes,
+    )?;
+
+    // Per-row target intron queues and NER/joint target aggregators coexist
+    // during a row, but do not persist across it.
+    let temporary_joint_count = ner_long_count
+        .checked_add(joint_long_count)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    add(
+        &mut bytes,
+        target_long_count as u128,
+        size_of::<IntronCandidateWindow>(),
+    )?;
+    add(
+        &mut bytes,
+        temporary_joint_count as u128,
+        size_of::<JointIntronWindow>(),
+    )?;
+    add(
+        &mut bytes,
+        (target_long_count as u128)
+            .checked_mul(temporary_queue_capacity)
+            .ok_or(ExecutionError::AllocationOverflow)?,
+        size_of::<IntronCandidate>(),
+    )?;
+    add(
+        &mut bytes,
+        (temporary_joint_count as u128)
+            .checked_mul(temporary_queue_capacity)
+            .ok_or(ExecutionError::AllocationOverflow)?,
+        size_of::<JointIntronCandidate>(),
+    )?;
+
+    // Compiled transition bookkeeping is small but scales with the graph and
+    // belongs in the requested DP plan as well.
+    add(&mut bytes, ir.transitions.len() as u128, size_of::<bool>())?;
+    add(
+        &mut bytes,
+        ir.state_count as u128,
+        size_of::<Vec<(u16, &model::Transition)>>(),
+    )?;
+    add(
+        &mut bytes,
+        ir.transitions.len() as u128,
+        size_of::<(u16, &model::Transition)>(),
+    )?;
+    Ok(bytes)
+}
+
+/// Rows that must remain live to evaluate every ordinary query advance and
+/// to insert every delayed query/NER long-state candidate.
+fn generic_checkpoint_query_spans(ir: &model::ModelIr) -> (usize, usize) {
+    let ordinary = ir
+        .transitions
+        .iter()
+        .map(|edge| edge.query_advance as usize)
+        .max()
+        .unwrap_or(0);
+    let ner = ner_long_states(ir)
+        .into_iter()
+        .map(|long| long.min_len)
+        .max()
+        .unwrap_or(0);
+    let joint = joint_long_states(ir)
+        .into_iter()
+        .map(|long| long.min_len)
+        .max()
+        .unwrap_or(0);
+    let query = query_long_states(ir)
+        .into_iter()
+        .map(|long| long.min_len)
+        .max()
+        .unwrap_or(0);
+    let delayed = ner.max(joint).max(query);
+    (delayed, ordinary)
+}
+
+fn generic_checkpoint_history_rows(ir: &model::ModelIr) -> usize {
+    let (past, future) = generic_checkpoint_query_spans(ir);
+    past.saturating_add(future).saturating_add(1)
+}
+
+fn generic_checkpoint_plan(
+    query_len: usize,
+    target_len: usize,
+    ir: &model::ModelIr,
+    budget_bytes: Option<u128>,
+) -> Result<(usize, u128), ExecutionError> {
+    let columns = target_len
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)? as u128;
+    let states = ir.state_count as u128;
+    let history_rows = generic_checkpoint_history_rows(ir)
+        .min(query_len.saturating_add(1))
+        .max(1) as u128;
+    let (_, future_rows) = generic_checkpoint_query_spans(ir);
+    let row_slots = columns
+        .checked_mul(states)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let checked_product = |values: &[u128]| -> Result<u128, ExecutionError> {
+        values.iter().try_fold(1_u128, |product, value| {
+            product
+                .checked_mul(*value)
+                .ok_or(ExecutionError::AllocationOverflow)
+        })
+    };
+    let checked_sum = |values: &[u128]| -> Result<u128, ExecutionError> {
+        values.iter().try_fold(0_u128, |sum, value| {
+            sum.checked_add(*value)
+                .ok_or(ExecutionError::AllocationOverflow)
+        })
+    };
+    let queue_capacity =
+        |min_len: usize, max_len: usize, axis_len: usize| -> Result<u128, ExecutionError> {
+            let live = max_len
+                .saturating_sub(min_len)
+                .saturating_add(1)
+                .min(axis_len.saturating_add(1));
+            live.checked_mul(2)
+                .map(|capacity| capacity.max(4) as u128)
+                .ok_or(ExecutionError::AllocationOverflow)
+        };
+    let ner = ner_long_states(ir);
+    let joint = joint_long_states(ir);
+    let query = query_long_states(ir);
+    let target = target_long_states(ir);
+    let persistent_windows = |count: usize,
+                              capacities: &[u128],
+                              window_bytes: usize,
+                              candidate_bytes: usize|
+     -> Result<u128, ExecutionError> {
+        let window_count = (count as u128)
+            .checked_mul(columns)
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        let candidates_per_column = capacities.iter().try_fold(0_u128, |sum, capacity| {
+            sum.checked_add(*capacity)
+                .ok_or(ExecutionError::AllocationOverflow)
+        })?;
+        checked_sum(&[
+            checked_product(&[count as u128, size_of::<Vec<JointIntronWindow>>() as u128])?,
+            checked_product(&[window_count, window_bytes as u128])?,
+            checked_product(&[columns, candidates_per_column, candidate_bytes as u128])?,
+        ])
+    };
+    let ner_capacities = ner
+        .iter()
+        .map(|long| queue_capacity(long.min_len, long.max_len, query_len))
+        .collect::<Result<Vec<_>, _>>()?;
+    let joint_capacities = joint
+        .iter()
+        .map(|long| queue_capacity(long.min_len, long.max_len, query_len))
+        .collect::<Result<Vec<_>, _>>()?;
+    let query_capacities = query
+        .iter()
+        .map(|long| queue_capacity(long.min_len, long.max_len, query_len))
+        .collect::<Result<Vec<_>, _>>()?;
+    let long_payload_bytes = checked_sum(&[
+        size_of::<GenericLongStatePayload>() as u128,
+        persistent_windows(
+            ner.len(),
+            &ner_capacities,
+            size_of::<JointIntronWindow>(),
+            size_of::<JointIntronCandidate>(),
+        )?,
+        persistent_windows(
+            joint.len(),
+            &joint_capacities,
+            size_of::<JointIntronWindow>(),
+            size_of::<JointIntronCandidate>(),
+        )?,
+        persistent_windows(
+            query.len(),
+            &query_capacities,
+            size_of::<IntronCandidateWindow>(),
+            size_of::<IntronCandidate>(),
+        )?,
+    ])?;
+    let temporary_single_candidate_bytes = target
+        .iter()
+        .map(|long| {
+            queue_capacity(long.min_len, long.max_len, target_len).and_then(|capacity| {
+                checked_product(&[capacity, size_of::<IntronCandidate>() as u128])
+            })
+        })
+        .try_fold(0_u128, |sum, bytes| {
+            sum.checked_add(bytes?)
+                .ok_or(ExecutionError::AllocationOverflow)
+        })?;
+    let temporary_ner_candidate_bytes = ner
+        .iter()
+        .map(|long| {
+            queue_capacity(long.min_len, long.max_len, target_len).and_then(|capacity| {
+                checked_product(&[capacity, size_of::<JointIntronCandidate>() as u128])
+            })
+        })
+        .try_fold(0_u128, |sum, bytes| {
+            sum.checked_add(bytes?)
+                .ok_or(ExecutionError::AllocationOverflow)
+        })?;
+    let temporary_joint_candidate_bytes = joint
+        .iter()
+        .map(|long| {
+            queue_capacity(long.min_len, long.max_len, target_len).and_then(|capacity| {
+                checked_product(&[capacity, size_of::<JointIntronCandidate>() as u128])
+            })
+        })
+        .try_fold(0_u128, |sum, bytes| {
+            sum.checked_add(bytes?)
+                .ok_or(ExecutionError::AllocationOverflow)
+        })?;
+    let temporary_window_bytes = checked_sum(&[
+        checked_product(&[
+            target.len() as u128,
+            size_of::<IntronCandidateWindow>() as u128,
+        ])?,
+        checked_product(&[
+            ner.len().saturating_add(joint.len()) as u128,
+            size_of::<JointIntronWindow>() as u128,
+        ])?,
+        temporary_single_candidate_bytes,
+        temporary_ner_candidate_bytes,
+        temporary_joint_candidate_bytes,
+    ])?;
+    let bookkeeping_bytes = checked_sum(&[
+        checked_product(&[ir.transitions.len() as u128, size_of::<bool>() as u128])?,
+        checked_product(&[states, size_of::<Vec<(u16, &model::Transition)>>() as u128])?,
+        checked_product(&[
+            ir.transitions.len() as u128,
+            size_of::<(u16, &model::Transition)>() as u128,
+        ])?,
+    ])?;
+    let rolling_bytes = checked_sum(&[
+        checked_product(&[history_rows, row_slots, size_of::<Score>() as u128])?,
+        checked_product(&[
+            history_rows,
+            row_slots,
+            size_of::<GenericCellShadow>() as u128,
+        ])?,
+        checked_product(&[
+            history_rows,
+            row_slots,
+            size_of::<Option<GenericParent>>() as u128,
+        ])?,
+        checked_product(&[history_rows, 3, size_of::<Option<usize>>() as u128])?,
+        long_payload_bytes,
+        temporary_window_bytes,
+        bookkeeping_bytes,
+    ])?;
+    let checkpoint_bytes = checked_sum(&[
+        size_of::<GenericCheckpoint>() as u128,
+        checked_product(&[history_rows, size_of::<GenericScoreCheckpointRow>() as u128])?,
+        checked_product(&[history_rows, row_slots, size_of::<Score>() as u128])?,
+        checked_product(&[
+            history_rows,
+            size_of::<GenericShadowCheckpointRow>() as u128,
+        ])?,
+        checked_product(&[
+            history_rows,
+            row_slots,
+            size_of::<GenericCellShadow>() as u128,
+        ])?,
+        checked_product(&[
+            future_rows as u128,
+            size_of::<GenericParentCheckpointRow>() as u128,
+        ])?,
+        checked_product(&[
+            future_rows as u128,
+            row_slots,
+            size_of::<Option<GenericParent>>() as u128,
+        ])?,
+        long_payload_bytes,
+    ])?;
+    let peak = |stride: usize| -> Result<u128, ExecutionError> {
+        let checkpoint_count = query_len.saturating_sub(1) / stride.max(1);
+        let saved_checkpoints = checked_product(&[checkpoint_count as u128, checkpoint_bytes])?;
+        let replay_parent_bytes = checked_product(&[
+            stride.saturating_add(1) as u128,
+            row_slots,
+            size_of::<Option<GenericParent>>() as u128,
+        ])?;
+        let replay_bytes = rolling_bytes
+            .checked_sub(checked_product(&[
+                history_rows,
+                row_slots,
+                size_of::<Option<GenericParent>>() as u128,
+            ])?)
+            .and_then(|base| base.checked_add(replay_parent_bytes))
+            .ok_or(ExecutionError::AllocationOverflow)?;
+        saved_checkpoints
+            .checked_add(rolling_bytes.max(replay_bytes))
+            .ok_or(ExecutionError::AllocationOverflow)
+    };
+    let mut best = (1_usize, peak(1)?);
+    for stride in 2..=query_len.max(1) {
+        let candidate = (stride, peak(stride)?);
+        let candidate_fits = budget_bytes.is_none_or(|budget| candidate.1 <= budget);
+        let best_fits = budget_bytes.is_none_or(|budget| best.1 <= budget);
+        if (candidate_fits && !best_fits) || (candidate_fits == best_fits && candidate.1 < best.1) {
+            best = candidate;
+        }
+    }
+    Ok(best)
+}
+
 /// Execute a validated finite C4-style graph with deterministic Viterbi
 /// traceback. Epsilon edges may form a DAG. Bounded introns are compiled into monotonic long states; phase post edges use
 /// parent-coordinate shadows to score non-contiguous split codons.
@@ -2278,6 +3204,372 @@ pub fn align_model_ir(
     strand: Strand,
 ) -> Result<Alignment, ExecutionError> {
     align_model_ir_with_intron(query, target, ir, scoring, IntronScoring::default(), strand)
+}
+
+/// Execute an IR with full tables when they fit the requested planning budget,
+/// otherwise use exact generic checkpoint traceback.  Built-in local ungapped
+/// graphs retain their smaller dedicated linear executors.
+pub fn align_model_ir_with_dp_memory(
+    query: &Sequence,
+    target: &Sequence,
+    ir: &model::ModelIr,
+    scoring: Scoring,
+    strand: Strand,
+    memory_mb: usize,
+) -> Result<Alignment, ExecutionError> {
+    if *ir == model::ungapped_translated(model::Scope::Anywhere) {
+        return align_ungapped_translated_linear(query, target, scoring, strand);
+    }
+    if *ir == model::ungapped(model::Scope::Anywhere) {
+        return align_ungapped_linear(query, target, scoring, strand);
+    }
+    let model = match ir.scope {
+        model::Scope::Corner => Model::Global,
+        model::Scope::Query => Model::BestFit,
+        model::Scope::Anywhere => Model::Local,
+        model::Scope::Edge => Model::Overlap,
+    };
+    if *ir == model.ir() {
+        Ok(align_with_dp_memory(
+            query, target, model, scoring, strand, memory_mb,
+        ))
+    } else {
+        let required_bytes = generic_full_dp_bytes(query.bases.len(), target.bases.len(), ir)?;
+        let limit_bytes = (memory_mb as u128) << 20;
+        if required_bytes <= limit_bytes {
+            align_model_ir(query, target, ir, scoring, strand)
+        } else {
+            align_model_ir_checkpointed(
+                query,
+                target,
+                ir,
+                scoring,
+                IntronScoring::default(),
+                strand,
+                memory_mb,
+                None,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_model_ir_checkpointed(
+    query: &Sequence,
+    target: &Sequence,
+    ir: &model::ModelIr,
+    scoring: Scoring,
+    intron: IntronScoring,
+    strand: Strand,
+    memory_mb: usize,
+    forbidden: Option<&HashSet<(usize, usize)>>,
+) -> Result<Alignment, ExecutionError> {
+    let n = query.bases.len();
+    let budget_bytes = (memory_mb as u128) << 20;
+    let (checkpoint_stride, _) =
+        generic_checkpoint_plan(n, target.bases.len(), ir, Some(budget_bytes))?;
+    let mut checkpoints = Vec::new();
+    let mut endpoint_state = (0, 0, ir.end);
+    let mut endpoint = align_model_ir_with_intron_forbidden_execution(
+        query,
+        target,
+        ir,
+        scoring,
+        intron,
+        strand,
+        forbidden,
+        Some((0, n)),
+        None,
+        Some(&mut endpoint_state),
+        checkpoint_stride,
+        Some(&mut checkpoints),
+        None,
+    )?;
+    let final_state = endpoint_state.2;
+    let mut cursor = endpoint_state;
+    let mut trace_segments = Vec::new();
+    let mut raw_segments = Vec::new();
+    loop {
+        let checkpoint = checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.row < cursor.0);
+        let first_row = checkpoint.map_or(0, |checkpoint| checkpoint.row + 1);
+        let mut start = cursor;
+        let segment = align_model_ir_with_intron_forbidden_execution(
+            query,
+            target,
+            ir,
+            scoring,
+            intron,
+            strand,
+            forbidden,
+            Some((first_row, cursor.0)),
+            Some(cursor),
+            Some(&mut start),
+            1,
+            None,
+            checkpoint,
+        )?;
+        trace_segments.push(segment.trace);
+        raw_segments.push(segment.raw_trace);
+        if checkpoint.is_none() {
+            cursor = start;
+            break;
+        }
+        if start == cursor {
+            cursor = start;
+            break;
+        }
+        cursor = start;
+    }
+    trace_segments.reverse();
+    raw_segments.reverse();
+    endpoint.trace.clear();
+    endpoint.raw_trace.clear();
+    for segment in trace_segments {
+        for run in segment {
+            TraceFragment::one(run).append_to(&mut endpoint.trace);
+        }
+    }
+    endpoint
+        .raw_trace
+        .extend(raw_segments.into_iter().flatten());
+    endpoint.query_start = cursor.0 as u64;
+    endpoint.target_start = if strand == Strand::Reverse {
+        target.bases.len() as u64 - cursor.1 as u64
+    } else {
+        cursor.1 as u64
+    };
+    debug_assert_eq!(final_state, ir.end);
+    Ok(endpoint)
+}
+
+/// Exact linear-space executor for the built-in local DNA ungapped C4 graph.
+/// Its diagonal recurrence needs only the immediately preceding score row.
+fn align_ungapped_linear(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    strand: Strand,
+) -> Result<Alignment, ExecutionError> {
+    let target_bases = if strand == Strand::Reverse {
+        reverse_complement(&target.bases)
+    } else {
+        target.bases.clone()
+    };
+    let columns = target_bases
+        .len()
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let mut score_rows = GenericScoreMatrix::rolling(target_bases.len(), 1, 2)?;
+    let mut previous_start = try_allocate_generic_table(columns, (0usize, 0usize))?;
+    let mut current_start = try_allocate_generic_table(columns, (0usize, 0usize))?;
+    let mut best_score = 0;
+    let mut best_end = (0usize, 0usize);
+    let mut best_start = (0usize, 0usize);
+    for i in 1..=query.bases.len() {
+        score_rows.clear_row(i);
+        current_start.fill((0, 0));
+        for j in 1..=target_bases.len() {
+            let edge_score = dna_score(query.bases[i - 1], target_bases[j - 1], scoring);
+            let previous_score = score_rows.get(i - 1, j - 1, 0);
+            let candidate = add(previous_score.max(0), edge_score);
+            if candidate > 0 {
+                score_rows.set(i, j, 0, candidate);
+                current_start[j] = if previous_score > 0 {
+                    previous_start[j - 1]
+                } else {
+                    (i - 1, j - 1)
+                };
+                if candidate > best_score {
+                    best_score = candidate;
+                    best_end = (i, j);
+                    best_start = current_start[j];
+                }
+            }
+        }
+        std::mem::swap(&mut previous_start, &mut current_start);
+    }
+    let match_count = best_end.0 - best_start.0;
+    let mut raw_trace = Vec::with_capacity(match_count + 2);
+    raw_trace.push(RawStep {
+        transition_id: 0,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    for offset in 0..match_count {
+        raw_trace.push(RawStep {
+            transition_id: 1,
+            query_advance: 1,
+            target_advance: 1,
+            score: dna_score(
+                query.bases[best_start.0 + offset],
+                target_bases[best_start.1 + offset],
+                scoring,
+            ),
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: 2,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    let trace = (match_count > 0)
+        .then_some(TraceRun {
+            transition_id: 1,
+            op: Op::Match,
+            query_advance: 1,
+            target_advance: 1,
+            repeats: match_count as u64,
+        })
+        .into_iter()
+        .collect();
+    let (target_start, target_end) = if strand == Strand::Reverse {
+        (
+            target.bases.len() as u64 - best_start.1 as u64,
+            target.bases.len() as u64 - best_end.1 as u64,
+        )
+    } else {
+        (best_start.1 as u64, best_end.1 as u64)
+    };
+    Ok(Alignment {
+        query_id: query.id.clone(),
+        target_id: target.id.clone(),
+        query_start: best_start.0 as u64,
+        query_end: best_end.0 as u64,
+        query_strand: Strand::Forward,
+        target_start,
+        target_end,
+        target_len: target.bases.len() as u64,
+        target_strand: strand,
+        score: best_score,
+        raw_trace,
+        trace,
+    })
+}
+
+/// Exact linear-space executor for the built-in local translated ungapped C4
+/// graph.  Its only consuming edge advances three bases on both axes, so a
+/// four-row score ring is sufficient and the traceback is one diagonal run.
+/// This is the first generic-IR dispatch that can satisfy a zero DP budget
+/// without a full parent table.
+fn align_ungapped_translated_linear(
+    query: &Sequence,
+    target: &Sequence,
+    scoring: Scoring,
+    strand: Strand,
+) -> Result<Alignment, ExecutionError> {
+    let target_bases = if strand == Strand::Reverse {
+        reverse_complement(&target.bases)
+    } else {
+        target.bases.clone()
+    };
+    let columns = target_bases
+        .len()
+        .checked_add(1)
+        .ok_or(ExecutionError::AllocationOverflow)?;
+    let mut score_rows = GenericScoreMatrix::rolling(target_bases.len(), 1, 4)?;
+    let mut start_rows = try_allocate_generic_table(4, Vec::<(usize, usize)>::new())?;
+    for row in &mut start_rows {
+        *row = try_allocate_generic_table(columns, (0, 0))?;
+    }
+    let mut best_score = 0;
+    let mut best_end = (0usize, 0usize);
+    let mut best_start = (0usize, 0usize);
+    for i in 3..=query.bases.len() {
+        let current = i % 4;
+        score_rows.clear_row(i);
+        start_rows[current].fill((0, 0));
+        let previous = (i - 3) % 4;
+        for j in 3..=target_bases.len() {
+            let edge_score = protein_score(
+                translate_dna(&query.bases[i - 3..i], 0)[0],
+                translate_dna(&target_bases[j - 3..j], 0)[0],
+                scoring,
+            );
+            let previous_score = score_rows.get(i - 3, j - 3, 0);
+            let candidate = add(previous_score.max(0), edge_score);
+            if candidate > 0 {
+                score_rows.set(i, j, 0, candidate);
+                start_rows[current][j] = if previous_score > 0 {
+                    start_rows[previous][j - 3]
+                } else {
+                    (i - 3, j - 3)
+                };
+                // The built-in IR has TiePolicy::Earliest, so retaining the
+                // first equal endpoint reproduces the generic executor.
+                if candidate > best_score {
+                    best_score = candidate;
+                    best_end = (i, j);
+                    best_start = start_rows[current][j];
+                }
+            }
+        }
+    }
+    let match_count = (best_end.0 - best_start.0) / 3;
+    let mut trace = Vec::with_capacity(usize::from(match_count > 0));
+    let mut raw_trace = Vec::with_capacity(match_count + 2);
+    raw_trace.push(RawStep {
+        transition_id: 0,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    for offset in 0..match_count {
+        let query_end = best_start.0 + (offset + 1) * 3;
+        let target_end = best_start.1 + (offset + 1) * 3;
+        let edge_score = protein_score(
+            translate_dna(&query.bases[query_end - 3..query_end], 0)[0],
+            translate_dna(&target_bases[target_end - 3..target_end], 0)[0],
+            scoring,
+        );
+        raw_trace.push(RawStep {
+            transition_id: 1,
+            query_advance: 3,
+            target_advance: 3,
+            score: edge_score,
+        });
+    }
+    if match_count > 0 {
+        trace.push(TraceRun {
+            transition_id: 1,
+            op: Op::Match,
+            query_advance: 3,
+            target_advance: 3,
+            repeats: match_count as u64,
+        });
+    }
+    raw_trace.push(RawStep {
+        transition_id: 2,
+        query_advance: 0,
+        target_advance: 0,
+        score: 0,
+    });
+    let (target_start, target_end) = if strand == Strand::Reverse {
+        (
+            target.bases.len() as u64 - best_start.1 as u64,
+            target.bases.len() as u64 - best_end.1 as u64,
+        )
+    } else {
+        (best_start.1 as u64, best_end.1 as u64)
+    };
+    Ok(Alignment {
+        query_id: query.id.clone(),
+        target_id: target.id.clone(),
+        query_start: best_start.0 as u64,
+        query_end: best_end.0 as u64,
+        query_strand: Strand::Forward,
+        target_start,
+        target_end,
+        target_len: target.bases.len() as u64,
+        target_strand: strand,
+        score: best_score,
+        raw_trace,
+        trace,
+    })
 }
 
 pub fn align_model_ir_with_intron(
@@ -2299,6 +3591,27 @@ fn align_model_ir_with_intron_forbidden(
     intron: IntronScoring,
     strand: Strand,
     forbidden: Option<&HashSet<(usize, usize)>>,
+) -> Result<Alignment, ExecutionError> {
+    align_model_ir_with_intron_forbidden_execution(
+        query, target, ir, scoring, intron, strand, forbidden, None, None, None, 1, None, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_model_ir_with_intron_forbidden_execution(
+    query: &Sequence,
+    target: &Sequence,
+    ir: &model::ModelIr,
+    scoring: Scoring,
+    intron: IntronScoring,
+    strand: Strand,
+    forbidden: Option<&HashSet<(usize, usize)>>,
+    row_range: Option<(usize, usize)>,
+    forced_end: Option<(usize, usize, model::StateId)>,
+    endpoint_state: Option<&mut (usize, usize, model::StateId)>,
+    checkpoint_stride: usize,
+    mut checkpoint_sink: Option<&mut Vec<GenericCheckpoint>>,
+    replay_checkpoint: Option<&GenericCheckpoint>,
 ) -> Result<Alignment, ExecutionError> {
     ir.validate().map_err(ExecutionError::InvalidModel)?;
     if ir.transitions.len() > u16::MAX as usize {
@@ -2330,21 +3643,52 @@ fn align_model_ir_with_intron_forbidden(
         target_bases.len(),
         ir.state_count as usize,
     );
-    let cells = (n + 1) * (m + 1);
-    let mut scores = vec![NEG_INF; cells * states];
-    let mut parents: Vec<Option<GenericParent>> = vec![None; cells * states];
-    let slot =
-        |i: usize, j: usize, state: model::StateId| idx(i, j, m + 1) * states + state as usize;
+    let reduced = row_range.is_some() || checkpoint_sink.is_some() || replay_checkpoint.is_some();
+    let first_compute_row = replay_checkpoint.map_or_else(
+        || row_range.map_or(0, |range| range.0),
+        |checkpoint| checkpoint.row + 1,
+    );
+    let last_compute_row = row_range.map_or(n, |range| range.1.min(n));
+    let (checkpoint_past_rows, checkpoint_future_rows) = generic_checkpoint_query_spans(ir);
+    let history_rows = generic_checkpoint_history_rows(ir).min(n + 1).max(1);
+    let mut scores = if reduced {
+        GenericScoreMatrix::rolling(m, states, history_rows)?
+    } else {
+        GenericScoreMatrix::full(n, m, states)?
+    };
+    let parent_rows = if replay_checkpoint.is_some() || forced_end.is_some() {
+        last_compute_row
+            .saturating_sub(first_compute_row)
+            .saturating_add(1)
+            .max(1)
+    } else if reduced {
+        history_rows
+    } else {
+        n + 1
+    };
+    let mut parents = if reduced {
+        GenericParentMatrix::rolling(m, states, parent_rows)?
+    } else {
+        GenericParentMatrix::full(n, m, states)?
+    };
+    let mut cell_shadows = if reduced {
+        GenericShadowMatrix::rolling(m, states, history_rows)?
+    } else {
+        GenericShadowMatrix::full(n, m, states)?
+    };
+    let columns = m.checked_add(1).ok_or(ExecutionError::AllocationOverflow)?;
     let legal_start = |i: usize, j: usize| match ir.scope {
         model::Scope::Corner => i == 0 && j == 0,
         model::Scope::Query => i == 0,
         model::Scope::Anywhere => true,
         model::Scope::Edge => i == 0 || j == 0,
     };
-    for i in 0..=n {
-        for j in 0..=m {
-            if legal_start(i, j) {
-                scores[slot(i, j, ir.start)] = 0;
+    if !reduced {
+        for i in 0..=n {
+            for j in 0..=m {
+                if legal_start(i, j) {
+                    scores.set(i, j, ir.start, 0);
+                }
             }
         }
     }
@@ -2353,7 +3697,7 @@ fn align_model_ir_with_intron_forbidden(
     let query_long_states = query_long_states(ir);
     let joint_long_states = joint_long_states(ir);
     let ner_long_states = ner_long_states(ir);
-    let mut compiled = vec![false; ir.transitions.len()];
+    let mut compiled = try_allocate_generic_table(ir.transitions.len(), false)?;
     for long in &long_states {
         compiled[long.open_transition as usize] = true;
         compiled[long.loop_transition as usize] = true;
@@ -2372,40 +3716,53 @@ fn align_model_ir_with_intron_forbidden(
     for long in &ner_long_states {
         compiled[long.transition as usize] = true;
     }
-    let mut outgoing = vec![Vec::<(u16, &model::Transition)>::new(); states];
+    let mut outgoing = try_allocate_generic_table(states, Vec::<(u16, &model::Transition)>::new())?;
     for (transition, edge) in ir.transitions.iter().enumerate() {
         outgoing[edge.from as usize].push((transition as u16, edge));
     }
-    let mut ner_long_columns: Vec<Vec<JointIntronWindow>> = ner_long_states
-        .iter()
-        .map(|_| (0..=m).map(|_| JointIntronWindow::default()).collect())
-        .collect();
-    let mut joint_long_columns: Vec<Vec<JointIntronWindow>> = joint_long_states
-        .iter()
-        .map(|_| (0..=m).map(|_| JointIntronWindow::default()).collect())
-        .collect();
-    let mut query_long_windows: Vec<Vec<IntronCandidateWindow>> = query_long_states
-        .iter()
-        .map(|_| (0..=m).map(|_| IntronCandidateWindow::default()).collect())
-        .collect();
-    for i in 0..=n {
+    let mut long_payload = GenericLongStatePayload::try_allocate(
+        ner_long_states.len(),
+        joint_long_states.len(),
+        query_long_states.len(),
+        columns,
+    )?;
+    if let Some(checkpoint) = replay_checkpoint {
+        long_payload = checkpoint.restore(&mut scores, &mut cell_shadows, &mut parents);
+    }
+    let legal_end = |i: usize, j: usize| match ir.scope {
+        model::Scope::Corner => i == n && j == m,
+        model::Scope::Query => i == n,
+        model::Scope::Anywhere => true,
+        model::Scope::Edge => i == n || j == m,
+    };
+    let mut tracked_end = (0usize, 0usize, NEG_INF);
+    for i in first_compute_row..=last_compute_row {
+        if reduced {
+            for j in 0..=m {
+                if legal_start(i, j) && scores.get(i, j, ir.start) < 0 {
+                    scores.set(i, j, ir.start, 0);
+                }
+            }
+        }
         for (long_index, long) in ner_long_states.iter().enumerate() {
             if i >= long.min_len {
                 let query_start = i - long.min_len;
                 for target_start in 0..=m {
-                    let source_score = scores[slot(query_start, target_start, long.source)];
+                    let source_score = scores.get(query_start, target_start, long.source);
                     if source_score > NEG_INF / 2 {
-                        ner_long_columns[long_index][target_start].insert(JointIntronCandidate {
-                            query_start,
-                            target_start,
-                            score: add(source_score, long.open),
-                            state_rank: 0,
-                        });
+                        long_payload.ner_columns[long_index][target_start].insert(
+                            JointIntronCandidate {
+                                query_start,
+                                target_start,
+                                score: add(source_score, long.open),
+                                state_rank: 0,
+                            },
+                        );
                     }
                 }
             }
             if i > long.max_len {
-                for column in &mut ner_long_columns[long_index] {
+                for column in &mut long_payload.ner_columns[long_index] {
                     column.expire_before(i - long.max_len);
                 }
             }
@@ -2417,7 +3774,7 @@ fn align_model_ir_with_intron_forbidden(
                     splice_score(&query.bases, query_start, long.donor, intron.force_gtag)
                 {
                     for target_start in 0..=m {
-                        let source_score = scores[slot(query_start, target_start, long.source)];
+                        let source_score = scores.get(query_start, target_start, long.source);
                         if source_score > 0 {
                             if let Some(target_donor) = splice_score(
                                 &target_bases,
@@ -2425,7 +3782,7 @@ fn align_model_ir_with_intron_forbidden(
                                 long.donor,
                                 intron.force_gtag,
                             ) {
-                                joint_long_columns[long_index][target_start].insert(
+                                long_payload.joint_columns[long_index][target_start].insert(
                                     JointIntronCandidate {
                                         query_start,
                                         target_start,
@@ -2445,28 +3802,24 @@ fn align_model_ir_with_intron_forbidden(
                 }
             }
             if i > long.max_len {
-                for column in &mut joint_long_columns[long_index] {
+                for column in &mut long_payload.joint_columns[long_index] {
                     column.expire_before(i - long.max_len);
                 }
             }
         }
-        let mut ner_long_targets: Vec<JointIntronWindow> = ner_long_states
-            .iter()
-            .map(|_| JointIntronWindow::default())
-            .collect();
-        let mut joint_long_targets: Vec<JointIntronWindow> = joint_long_states
-            .iter()
-            .map(|_| JointIntronWindow::default())
-            .collect();
-        let mut long_windows: Vec<IntronCandidateWindow> = long_states
-            .iter()
-            .map(|_| IntronCandidateWindow::default())
-            .collect();
+        let mut ner_long_targets =
+            try_allocate_generic_table(ner_long_states.len(), JointIntronWindow::default())?;
+        let mut joint_long_targets =
+            try_allocate_generic_table(joint_long_states.len(), JointIntronWindow::default())?;
+        let mut long_windows =
+            try_allocate_generic_table(long_states.len(), IntronCandidateWindow::default())?;
         for j in 0..=m {
             for (long_index, long) in ner_long_states.iter().enumerate() {
                 if j >= long.min_len {
                     let target_start = j - long.min_len;
-                    if let Some(candidate) = ner_long_columns[long_index][target_start].best() {
+                    if let Some(candidate) =
+                        long_payload.ner_columns[long_index][target_start].best()
+                    {
                         ner_long_targets[long_index].insert(candidate);
                     }
                 }
@@ -2480,34 +3833,48 @@ fn align_model_ir_with_intron_forbidden(
                     }
                 }
                 if let Some(candidate) = ner_long_targets[long_index].best() {
-                    let destination = slot(i, j, long.destination);
-                    if candidate.score > scores[destination] {
-                        scores[destination] = candidate.score;
-                        parents[destination] = Some(GenericParent {
-                            state: long.source,
-                            query: candidate.query_start,
-                            target: candidate.target_start,
-                            fragment: TraceFragment::one(TraceRun {
-                                transition_id: long.transition,
-                                op: Op::Ner,
-                                query_advance: (i - candidate.query_start) as u32,
-                                target_advance: (j - candidate.target_start) as u32,
-                                repeats: 1,
-                            }),
-                            raw_fragment: RawFragment::one(RawStep {
-                                transition_id: long.transition,
-                                query_advance: (i - candidate.query_start) as u32,
-                                target_advance: (j - candidate.target_start) as u32,
-                                score: long.open,
-                            }),
-                        });
+                    if candidate.score > scores.get(i, j, long.destination) {
+                        scores.set(i, j, long.destination, candidate.score);
+                        cell_shadows.set(
+                            i,
+                            j,
+                            long.destination,
+                            GenericCellShadow {
+                                phase_donor: Some((candidate.query_start, candidate.target_start)),
+                            },
+                        );
+                        parents.set(
+                            i,
+                            j,
+                            long.destination,
+                            GenericParent {
+                                state: long.source,
+                                query: candidate.query_start,
+                                target: candidate.target_start,
+                                fragment: TraceFragment::one(TraceRun {
+                                    transition_id: long.transition,
+                                    op: Op::Ner,
+                                    query_advance: (i - candidate.query_start) as u32,
+                                    target_advance: (j - candidate.target_start) as u32,
+                                    repeats: 1,
+                                }),
+                                raw_fragment: RawFragment::one(RawStep {
+                                    transition_id: long.transition,
+                                    query_advance: (i - candidate.query_start) as u32,
+                                    target_advance: (j - candidate.target_start) as u32,
+                                    score: long.open,
+                                }),
+                            },
+                        );
                     }
                 }
             }
             for (long_index, long) in joint_long_states.iter().enumerate() {
                 if j >= long.min_len {
                     let target_start = j - long.min_len;
-                    if let Some(candidate) = joint_long_columns[long_index][target_start].best() {
+                    if let Some(candidate) =
+                        long_payload.joint_columns[long_index][target_start].best()
+                    {
                         joint_long_targets[long_index].insert(candidate);
                     }
                 }
@@ -2526,85 +3893,100 @@ fn align_model_ir_with_intron_forbidden(
                         splice_score(&query.bases, i - 2, long.acceptor, intron.force_gtag),
                         splice_score(&target_bases, j - 2, long.acceptor, intron.force_gtag),
                     ) {
-                        let destination = slot(i, j, long.destination);
                         let score = add(add(candidate.score, query_acceptor), target_acceptor);
-                        if score > scores[destination] {
-                            scores[destination] = score;
-                            parents[destination] = Some(GenericParent {
-                                state: long.source,
-                                query: candidate.query_start,
-                                target: candidate.target_start,
-                                fragment: TraceFragment::intron(
-                                    TraceRun {
-                                        transition_id: long.open_transition,
-                                        op: if long.donor == SpliceType::DonorForward {
-                                            Op::Splice5
-                                        } else {
-                                            Op::Splice3
+                        if score > scores.get(i, j, long.destination) {
+                            scores.set(i, j, long.destination, score);
+                            cell_shadows.set(
+                                i,
+                                j,
+                                long.destination,
+                                GenericCellShadow {
+                                    phase_donor: Some((
+                                        candidate.query_start,
+                                        candidate.target_start,
+                                    )),
+                                },
+                            );
+                            parents.set(
+                                i,
+                                j,
+                                long.destination,
+                                GenericParent {
+                                    state: long.source,
+                                    query: candidate.query_start,
+                                    target: candidate.target_start,
+                                    fragment: TraceFragment::intron(
+                                        TraceRun {
+                                            transition_id: long.open_transition,
+                                            op: if long.donor == SpliceType::DonorForward {
+                                                Op::Splice5
+                                            } else {
+                                                Op::Splice3
+                                            },
+                                            query_advance: 2,
+                                            target_advance: 2,
+                                            repeats: 1,
                                         },
-                                        query_advance: 2,
-                                        target_advance: 2,
-                                        repeats: 1,
-                                    },
-                                    TraceRun {
-                                        transition_id: long.loop_transition,
-                                        op: Op::Intron,
-                                        query_advance: (i - candidate.query_start - 4) as u32,
-                                        target_advance: (j - candidate.target_start - 4) as u32,
-                                        repeats: 1,
-                                    },
-                                    TraceRun {
-                                        transition_id: long.close_transition,
-                                        op: if long.acceptor == SpliceType::AcceptorForward {
-                                            Op::Splice3
-                                        } else {
-                                            Op::Splice5
+                                        TraceRun {
+                                            transition_id: long.loop_transition,
+                                            op: Op::Intron,
+                                            query_advance: (i - candidate.query_start - 4) as u32,
+                                            target_advance: (j - candidate.target_start - 4) as u32,
+                                            repeats: 1,
                                         },
-                                        query_advance: 2,
-                                        target_advance: 2,
-                                        repeats: 1,
-                                    },
-                                ),
-                                raw_fragment: RawFragment::three(
-                                    RawStep {
-                                        transition_id: long.open_transition,
-                                        query_advance: 2,
-                                        target_advance: 2,
-                                        score: intron
-                                            .open_penalty
-                                            .saturating_add(
-                                                splice_score(
-                                                    &query.bases,
-                                                    candidate.query_start,
-                                                    long.donor,
-                                                    intron.force_gtag,
+                                        TraceRun {
+                                            transition_id: long.close_transition,
+                                            op: if long.acceptor == SpliceType::AcceptorForward {
+                                                Op::Splice3
+                                            } else {
+                                                Op::Splice5
+                                            },
+                                            query_advance: 2,
+                                            target_advance: 2,
+                                            repeats: 1,
+                                        },
+                                    ),
+                                    raw_fragment: RawFragment::three(
+                                        RawStep {
+                                            transition_id: long.open_transition,
+                                            query_advance: 2,
+                                            target_advance: 2,
+                                            score: intron
+                                                .open_penalty
+                                                .saturating_add(
+                                                    splice_score(
+                                                        &query.bases,
+                                                        candidate.query_start,
+                                                        long.donor,
+                                                        intron.force_gtag,
+                                                    )
+                                                    .unwrap_or(0),
                                                 )
-                                                .unwrap_or(0),
-                                            )
-                                            .saturating_add(
-                                                splice_score(
-                                                    &target_bases,
-                                                    candidate.target_start,
-                                                    long.donor,
-                                                    intron.force_gtag,
-                                                )
-                                                .unwrap_or(0),
-                                            ),
-                                    },
-                                    RawStep {
-                                        transition_id: long.loop_transition,
-                                        query_advance: (i - candidate.query_start - 4) as u32,
-                                        target_advance: (j - candidate.target_start - 4) as u32,
-                                        score: 0,
-                                    },
-                                    RawStep {
-                                        transition_id: long.close_transition,
-                                        query_advance: 2,
-                                        target_advance: 2,
-                                        score: query_acceptor.saturating_add(target_acceptor),
-                                    },
-                                ),
-                            });
+                                                .saturating_add(
+                                                    splice_score(
+                                                        &target_bases,
+                                                        candidate.target_start,
+                                                        long.donor,
+                                                        intron.force_gtag,
+                                                    )
+                                                    .unwrap_or(0),
+                                                ),
+                                        },
+                                        RawStep {
+                                            transition_id: long.loop_transition,
+                                            query_advance: (i - candidate.query_start - 4) as u32,
+                                            target_advance: (j - candidate.target_start - 4) as u32,
+                                            score: 0,
+                                        },
+                                        RawStep {
+                                            transition_id: long.close_transition,
+                                            query_advance: 2,
+                                            target_advance: 2,
+                                            score: query_acceptor.saturating_add(target_acceptor),
+                                        },
+                                    ),
+                                },
+                            );
                         }
                     }
                 }
@@ -2612,12 +3994,12 @@ fn align_model_ir_with_intron_forbidden(
             for (long_index, long) in query_long_states.iter().enumerate() {
                 if i >= long.min_len {
                     let source_i = i - long.min_len;
-                    let source_score = scores[slot(source_i, j, long.source)];
+                    let source_score = scores.get(source_i, j, long.source);
                     if source_score > 0 {
                         if let Some(donor) =
                             splice_score(&query.bases, source_i, long.donor, intron.force_gtag)
                         {
-                            query_long_windows[long_index][j].insert(IntronCandidate {
+                            long_payload.query_windows[long_index][j].insert(IntronCandidate {
                                 start: source_i,
                                 score: add(source_score, intron.open_penalty.saturating_add(donor)),
                                 state_rank: 0,
@@ -2626,81 +4008,93 @@ fn align_model_ir_with_intron_forbidden(
                     }
                 }
                 if i > long.max_len {
-                    query_long_windows[long_index][j].expire_before(i - long.max_len);
+                    long_payload.query_windows[long_index][j].expire_before(i - long.max_len);
                 }
                 if i >= 2 {
                     if let (Some(candidate), Some(acceptor)) = (
-                        query_long_windows[long_index][j].best(),
+                        long_payload.query_windows[long_index][j].best(),
                         splice_score(&query.bases, i - 2, long.acceptor, intron.force_gtag),
                     ) {
-                        let destination = slot(i, j, long.destination);
                         let score = add(candidate.score, acceptor);
-                        if score > scores[destination] {
-                            scores[destination] = score;
-                            parents[destination] = Some(GenericParent {
-                                state: long.source,
-                                query: candidate.start,
-                                target: j,
-                                fragment: TraceFragment::intron(
-                                    TraceRun {
-                                        transition_id: long.open_transition,
-                                        op: if long.donor == SpliceType::DonorForward {
-                                            Op::Splice5
-                                        } else {
-                                            Op::Splice3
+                        if score > scores.get(i, j, long.destination) {
+                            scores.set(i, j, long.destination, score);
+                            cell_shadows.set(
+                                i,
+                                j,
+                                long.destination,
+                                GenericCellShadow {
+                                    phase_donor: Some((candidate.start, j)),
+                                },
+                            );
+                            parents.set(
+                                i,
+                                j,
+                                long.destination,
+                                GenericParent {
+                                    state: long.source,
+                                    query: candidate.start,
+                                    target: j,
+                                    fragment: TraceFragment::intron(
+                                        TraceRun {
+                                            transition_id: long.open_transition,
+                                            op: if long.donor == SpliceType::DonorForward {
+                                                Op::Splice5
+                                            } else {
+                                                Op::Splice3
+                                            },
+                                            query_advance: 2,
+                                            target_advance: 0,
+                                            repeats: 1,
                                         },
-                                        query_advance: 2,
-                                        target_advance: 0,
-                                        repeats: 1,
-                                    },
-                                    TraceRun {
-                                        transition_id: long.loop_transition,
-                                        op: Op::Intron,
-                                        query_advance: (i - candidate.start - 4) as u32,
-                                        target_advance: 0,
-                                        repeats: 1,
-                                    },
-                                    TraceRun {
-                                        transition_id: long.close_transition,
-                                        op: if long.acceptor == SpliceType::AcceptorForward {
-                                            Op::Splice3
-                                        } else {
-                                            Op::Splice5
+                                        TraceRun {
+                                            transition_id: long.loop_transition,
+                                            op: Op::Intron,
+                                            query_advance: (i - candidate.start - 4) as u32,
+                                            target_advance: 0,
+                                            repeats: 1,
                                         },
-                                        query_advance: 2,
-                                        target_advance: 0,
-                                        repeats: 1,
-                                    },
-                                ),
-                                raw_fragment: RawFragment::three(
-                                    RawStep {
-                                        transition_id: long.open_transition,
-                                        query_advance: 2,
-                                        target_advance: 0,
-                                        score: intron.open_penalty.saturating_add(
-                                            splice_score(
-                                                &query.bases,
-                                                candidate.start,
-                                                long.donor,
-                                                intron.force_gtag,
-                                            )
-                                            .unwrap_or(0),
-                                        ),
-                                    },
-                                    RawStep {
-                                        transition_id: long.loop_transition,
-                                        query_advance: (i - candidate.start - 4) as u32,
-                                        target_advance: 0,
-                                        score: 0,
-                                    },
-                                    RawStep {
-                                        transition_id: long.close_transition,
-                                        query_advance: 2,
-                                        target_advance: 0,
-                                        score: acceptor,
-                                    },
-                                ),
-                            });
+                                        TraceRun {
+                                            transition_id: long.close_transition,
+                                            op: if long.acceptor == SpliceType::AcceptorForward {
+                                                Op::Splice3
+                                            } else {
+                                                Op::Splice5
+                                            },
+                                            query_advance: 2,
+                                            target_advance: 0,
+                                            repeats: 1,
+                                        },
+                                    ),
+                                    raw_fragment: RawFragment::three(
+                                        RawStep {
+                                            transition_id: long.open_transition,
+                                            query_advance: 2,
+                                            target_advance: 0,
+                                            score: intron.open_penalty.saturating_add(
+                                                splice_score(
+                                                    &query.bases,
+                                                    candidate.start,
+                                                    long.donor,
+                                                    intron.force_gtag,
+                                                )
+                                                .unwrap_or(0),
+                                            ),
+                                        },
+                                        RawStep {
+                                            transition_id: long.loop_transition,
+                                            query_advance: (i - candidate.start - 4) as u32,
+                                            target_advance: 0,
+                                            score: 0,
+                                        },
+                                        RawStep {
+                                            transition_id: long.close_transition,
+                                            query_advance: 2,
+                                            target_advance: 0,
+                                            score: acceptor,
+                                        },
+                                    ),
+                                },
+                            );
                         }
                     }
                 }
@@ -2708,7 +4102,7 @@ fn align_model_ir_with_intron_forbidden(
             for (long_index, long) in long_states.iter().enumerate() {
                 if j >= long.min_len {
                     let source_j = j - long.min_len;
-                    let source_score = scores[slot(i, source_j, long.source)];
+                    let source_score = scores.get(i, source_j, long.source);
                     if source_score > 0 {
                         if let Some(donor) =
                             splice_score(&target_bases, source_j, long.donor, intron.force_gtag)
@@ -2729,80 +4123,92 @@ fn align_model_ir_with_intron_forbidden(
                         long_windows[long_index].best(),
                         splice_score(&target_bases, j - 2, long.acceptor, intron.force_gtag),
                     ) {
-                        let destination = slot(i, j, long.destination);
                         let score = add(candidate.score, acceptor);
-                        if score > scores[destination] {
-                            scores[destination] = score;
-                            parents[destination] = Some(GenericParent {
-                                state: long.source,
-                                query: i,
-                                target: candidate.start,
-                                fragment: TraceFragment::intron(
-                                    TraceRun {
-                                        transition_id: long.open_transition,
-                                        op: if long.donor == SpliceType::DonorForward {
-                                            Op::Splice5
-                                        } else {
-                                            Op::Splice3
+                        if score > scores.get(i, j, long.destination) {
+                            scores.set(i, j, long.destination, score);
+                            cell_shadows.set(
+                                i,
+                                j,
+                                long.destination,
+                                GenericCellShadow {
+                                    phase_donor: Some((i, candidate.start)),
+                                },
+                            );
+                            parents.set(
+                                i,
+                                j,
+                                long.destination,
+                                GenericParent {
+                                    state: long.source,
+                                    query: i,
+                                    target: candidate.start,
+                                    fragment: TraceFragment::intron(
+                                        TraceRun {
+                                            transition_id: long.open_transition,
+                                            op: if long.donor == SpliceType::DonorForward {
+                                                Op::Splice5
+                                            } else {
+                                                Op::Splice3
+                                            },
+                                            query_advance: 0,
+                                            target_advance: 2,
+                                            repeats: 1,
                                         },
-                                        query_advance: 0,
-                                        target_advance: 2,
-                                        repeats: 1,
-                                    },
-                                    TraceRun {
-                                        transition_id: long.loop_transition,
-                                        op: Op::Intron,
-                                        query_advance: 0,
-                                        target_advance: (j - candidate.start - 4) as u32,
-                                        repeats: 1,
-                                    },
-                                    TraceRun {
-                                        transition_id: long.close_transition,
-                                        op: if long.acceptor == SpliceType::AcceptorForward {
-                                            Op::Splice3
-                                        } else {
-                                            Op::Splice5
+                                        TraceRun {
+                                            transition_id: long.loop_transition,
+                                            op: Op::Intron,
+                                            query_advance: 0,
+                                            target_advance: (j - candidate.start - 4) as u32,
+                                            repeats: 1,
                                         },
-                                        query_advance: 0,
-                                        target_advance: 2,
-                                        repeats: 1,
-                                    },
-                                ),
-                                raw_fragment: RawFragment::three(
-                                    RawStep {
-                                        transition_id: long.open_transition,
-                                        query_advance: 0,
-                                        target_advance: 2,
-                                        score: intron.open_penalty.saturating_add(
-                                            splice_score(
-                                                &target_bases,
-                                                candidate.start,
-                                                long.donor,
-                                                intron.force_gtag,
-                                            )
-                                            .unwrap_or(0),
-                                        ),
-                                    },
-                                    RawStep {
-                                        transition_id: long.loop_transition,
-                                        query_advance: 0,
-                                        target_advance: (j - candidate.start - 4) as u32,
-                                        score: 0,
-                                    },
-                                    RawStep {
-                                        transition_id: long.close_transition,
-                                        query_advance: 0,
-                                        target_advance: 2,
-                                        score: acceptor,
-                                    },
-                                ),
-                            });
+                                        TraceRun {
+                                            transition_id: long.close_transition,
+                                            op: if long.acceptor == SpliceType::AcceptorForward {
+                                                Op::Splice3
+                                            } else {
+                                                Op::Splice5
+                                            },
+                                            query_advance: 0,
+                                            target_advance: 2,
+                                            repeats: 1,
+                                        },
+                                    ),
+                                    raw_fragment: RawFragment::three(
+                                        RawStep {
+                                            transition_id: long.open_transition,
+                                            query_advance: 0,
+                                            target_advance: 2,
+                                            score: intron.open_penalty.saturating_add(
+                                                splice_score(
+                                                    &target_bases,
+                                                    candidate.start,
+                                                    long.donor,
+                                                    intron.force_gtag,
+                                                )
+                                                .unwrap_or(0),
+                                            ),
+                                        },
+                                        RawStep {
+                                            transition_id: long.loop_transition,
+                                            query_advance: 0,
+                                            target_advance: (j - candidate.start - 4) as u32,
+                                            score: 0,
+                                        },
+                                        RawStep {
+                                            transition_id: long.close_transition,
+                                            query_advance: 0,
+                                            target_advance: 2,
+                                            score: acceptor,
+                                        },
+                                    ),
+                                },
+                            );
                         }
                     }
                 }
             }
             for &state in &order {
-                let source_score = scores[slot(i, j, state)];
+                let source_score = scores.get(i, j, state);
                 if source_score <= NEG_INF / 2 {
                     continue;
                 }
@@ -2812,7 +4218,7 @@ fn align_model_ir_with_intron_forbidden(
                     }
                     let ni = i + edge.query_advance as usize;
                     let nj = j + edge.target_advance as usize;
-                    if ni > n || nj > m {
+                    if ni > last_compute_row || nj > m {
                         continue;
                     }
                     let scores_pair = edge.label == model::Label::Match
@@ -2839,17 +4245,9 @@ fn align_model_ir_with_intron_forbidden(
                                 (1, 3) | (3, 1) | (3, 3)
                             ));
                     let edge_score = if is_partial_codon {
-                        let (mut shadow_i, mut shadow_j, mut shadow_state) = (i, j, state);
-                        let (donor_i, donor_j) = loop {
-                            let Some(parent) = parents[slot(shadow_i, shadow_j, shadow_state)]
-                            else {
-                                continue 'edges;
-                            };
-                            if parent.query != shadow_i || parent.target != shadow_j {
-                                break (parent.query, parent.target);
-                            }
-                            (shadow_i, shadow_j, shadow_state) =
-                                (parent.query, parent.target, parent.state);
+                        let Some((donor_i, donor_j)) = cell_shadows.get(i, j, state).phase_donor
+                        else {
+                            continue 'edges;
                         };
                         let query_is_protein = edge.query_advance == 1 && protein_query;
                         let target_is_protein = edge.target_advance == 1 && protein_target;
@@ -2882,15 +4280,15 @@ fn align_model_ir_with_intron_forbidden(
                         generic_kernel_score(edge, &query.bases, &target_bases, ni, nj, scoring)?
                     };
                     let candidate = add(source_score, edge_score);
-                    let destination = slot(ni, nj, edge.to);
-                    let current_priority = parents[destination]
+                    let current_priority = parents
+                        .get(ni, nj, edge.to)
                         .map_or(0, |parent| generic_state_priority(ir, parent.state));
                     let candidate_priority = generic_state_priority(ir, state);
-                    if candidate > scores[destination]
-                        || (candidate == scores[destination]
+                    if candidate > scores.get(ni, nj, edge.to)
+                        || (candidate == scores.get(ni, nj, edge.to)
                             && candidate_priority > current_priority)
                     {
-                        scores[destination] = candidate;
+                        scores.set(ni, nj, edge.to, candidate);
                         let fragment = generic_op(edge).map_or_else(TraceFragment::empty, |op| {
                             TraceFragment::one(TraceRun {
                                 transition_id: transition,
@@ -2900,51 +4298,100 @@ fn align_model_ir_with_intron_forbidden(
                                 repeats: 1,
                             })
                         });
-                        parents[destination] = Some(GenericParent {
-                            state,
-                            query: i,
-                            target: j,
-                            fragment,
-                            raw_fragment: RawFragment::one(RawStep {
-                                transition_id: transition,
-                                query_advance: edge.query_advance,
-                                target_advance: edge.target_advance,
-                                score: edge_score,
-                            }),
-                        });
+                        parents.set(
+                            ni,
+                            nj,
+                            edge.to,
+                            GenericParent {
+                                state,
+                                query: i,
+                                target: j,
+                                fragment,
+                                raw_fragment: RawFragment::one(RawStep {
+                                    transition_id: transition,
+                                    query_advance: edge.query_advance,
+                                    target_advance: edge.target_advance,
+                                    score: edge_score,
+                                }),
+                            },
+                        );
+                        let phase_donor = if ni != i || nj != j {
+                            Some((i, j))
+                        } else {
+                            cell_shadows.get(i, j, state).phase_donor
+                        };
+                        cell_shadows.set(ni, nj, edge.to, GenericCellShadow { phase_donor });
+                    }
+                }
+            }
+            if legal_end(i, j) {
+                let score = scores.get(i, j, ir.end);
+                let replace = score > tracked_end.2
+                    || (score == tracked_end.2
+                        && ir.tie_policy == model::TiePolicy::Latest
+                        && (i, j) > (tracked_end.0, tracked_end.1));
+                if replace {
+                    tracked_end = (i, j, score);
+                }
+            }
+        }
+        if let Some(checkpoints) = checkpoint_sink.as_deref_mut() {
+            if i > 0
+                && (i % checkpoint_stride.max(1) == 0 || i == last_compute_row)
+                && i < last_compute_row
+            {
+                checkpoints.push(GenericCheckpoint::capture(
+                    i,
+                    checkpoint_past_rows,
+                    checkpoint_future_rows,
+                    last_compute_row,
+                    &scores,
+                    &cell_shadows,
+                    &parents,
+                    &long_payload,
+                )?);
+            }
+        }
+    }
+    let forced_state = forced_end.map_or(ir.end, |endpoint| endpoint.2);
+    let end = if let Some((i, j, state)) = forced_end {
+        (i, j, scores.get(i, j, state))
+    } else if reduced {
+        tracked_end
+    } else {
+        let mut end = (0usize, 0usize, NEG_INF);
+        for i in 0..=n {
+            for j in 0..=m {
+                if legal_end(i, j) {
+                    let score = scores.get(i, j, ir.end);
+                    let replace = score > end.2
+                        || (score == end.2
+                            && ir.tie_policy == model::TiePolicy::Latest
+                            && (i, j) > (end.0, end.1));
+                    if replace {
+                        end = (i, j, score);
                     }
                 }
             }
         }
-    }
-    let legal_end = |i: usize, j: usize| match ir.scope {
-        model::Scope::Corner => i == n && j == m,
-        model::Scope::Query => i == n,
-        model::Scope::Anywhere => true,
-        model::Scope::Edge => i == n || j == m,
+        end
     };
-    let mut end = (0usize, 0usize, NEG_INF);
-    for i in 0..=n {
-        for j in 0..=m {
-            if legal_end(i, j) {
-                let score = scores[slot(i, j, ir.end)];
-                let replace = score > end.2
-                    || (score == end.2
-                        && ir.tie_policy == model::TiePolicy::Latest
-                        && (i, j) > (end.0, end.1));
-                if replace {
-                    end = (i, j, score);
-                }
-            }
-        }
-    }
     let (mut i, mut j, score) = end;
     let (query_end, oriented_target_end) = (i as u64, j as u64);
-    let mut state = ir.end;
+    let mut state = forced_state;
     let mut reversed = Vec::new();
-    while let Some(parent) = parents[slot(i, j, state)] {
+    let boundary_row = replay_checkpoint.map(|checkpoint| checkpoint.row);
+    let forward_only =
+        checkpoint_sink.is_some() && forced_end.is_none() && replay_checkpoint.is_none();
+    while !forward_only && boundary_row.is_none_or(|boundary| i > boundary) {
+        let Some(parent) = parents.get(i, j, state) else {
+            break;
+        };
         reversed.push((parent.fragment, parent.raw_fragment));
         (i, j, state) = (parent.query, parent.target, parent.state);
+    }
+    if let Some(endpoint_state) = endpoint_state {
+        *endpoint_state = (i, j, state);
     }
     reversed.reverse();
     let mut trace = Vec::new();
@@ -3035,6 +4482,22 @@ fn align_with_scorer_forbidden(
     strand: Strand,
     scorer: fn(u8, u8, Scoring) -> Score,
     forbidden: Option<&HashSet<(usize, usize)>>,
+) -> Alignment {
+    align_with_scorer_forbidden_tie_break(
+        query, target, model, scoring, strand, scorer, forbidden, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn align_with_scorer_forbidden_tie_break(
+    query: &Sequence,
+    target: &Sequence,
+    model: Model,
+    scoring: Scoring,
+    strand: Strand,
+    scorer: fn(u8, u8, Scoring) -> Score,
+    forbidden: Option<&HashSet<(usize, usize)>>,
+    leftmost_bestfit_endpoint: bool,
 ) -> Alignment {
     let ir = model.ir();
     debug_assert!(ir.validate().is_ok(), "built-in model must be valid");
@@ -3151,7 +4614,12 @@ fn align_with_scorer_forbidden(
             }
             let k = idx(i, j, cols);
             for (v, st) in [(mm[k], State::M), (ii[k], State::I), (dd[k], State::D)] {
-                if v > end.3 || (v == end.3 && (i, j, st.rank()) > (end.0, end.1, end.2.rank())) {
+                let prefer_tie = if model == Model::BestFit && leftmost_bestfit_endpoint {
+                    (i, j, st.rank()) < (end.0, end.1, end.2.rank())
+                } else {
+                    (i, j, st.rank()) > (end.0, end.1, end.2.rank())
+                };
+                if v > end.3 || (v == end.3 && prefer_tie) {
                     end = (i, j, st, v);
                 }
             }
@@ -3847,6 +5315,45 @@ fn align_model_ir_suboptimal_pair(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+fn align_model_ir_suboptimal_pair_with_dp_memory(
+    query: &Sequence,
+    target: &Sequence,
+    ir: &model::ModelIr,
+    scoring: Scoring,
+    intron: IntronScoring,
+    strand: Strand,
+    threshold: Score,
+    memory_mb: usize,
+) -> Result<Vec<Alignment>, ExecutionError> {
+    let required_bytes = generic_full_dp_bytes(query.bases.len(), target.bases.len(), ir)?;
+    let limit_bytes = (memory_mb as u128) << 20;
+    try_enumerate_suboptimal_pair(query, target, threshold, |forbidden| {
+        if required_bytes <= limit_bytes {
+            align_model_ir_with_intron_forbidden(
+                query,
+                target,
+                ir,
+                scoring,
+                intron,
+                strand,
+                Some(forbidden),
+            )
+        } else {
+            align_model_ir_checkpointed(
+                query,
+                target,
+                ir,
+                scoring,
+                intron,
+                strand,
+                memory_mb,
+                Some(forbidden),
+            )
+        }
+    })
+}
+
 pub fn align_ungapped_translated_database_suboptimal(
     queries: &[Sequence],
     targets: &[Sequence],
@@ -3893,6 +5400,57 @@ pub fn align_ungapped_translated_database_suboptimal(
     out
 }
 
+/// Translated ungapped suboptimal enumeration with a checked generic DP
+/// budget.  It preflights every pair before enumeration can allocate a table.
+pub fn align_ungapped_translated_database_suboptimal_with_dp_memory(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    threshold: Score,
+    both_strands: bool,
+    memory_mb: usize,
+) -> Result<Vec<Alignment>, ExecutionError> {
+    let ir = model::ungapped_translated(model::Scope::Anywhere);
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_model_ir_suboptimal_pair_with_dp_memory(
+                query,
+                target,
+                &ir,
+                scoring,
+                IntronScoring::default(),
+                Strand::Forward,
+                threshold,
+                memory_mb,
+            )?);
+            if both_strands {
+                let reverse_query = Sequence {
+                    id: query.id.clone(),
+                    bases: reverse_complement(&query.bases),
+                };
+                let mut reverse = align_model_ir_suboptimal_pair_with_dp_memory(
+                    &reverse_query,
+                    target,
+                    &ir,
+                    scoring,
+                    IntronScoring::default(),
+                    Strand::Forward,
+                    threshold,
+                    memory_mb,
+                )?;
+                for alignment in &mut reverse {
+                    alignment.query_start = query.bases.len() as u64 - alignment.query_start;
+                    alignment.query_end = query.bases.len() as u64 - alignment.query_end;
+                    alignment.query_strand = Strand::Reverse;
+                }
+                out.extend(reverse);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn align_ner_database_suboptimal(
     queries: &[Sequence],
@@ -3933,6 +5491,51 @@ pub fn align_ner_database_suboptimal(
     out
 }
 
+/// NER suboptimal enumeration with generic checkpoint traceback when its full
+/// table exceeds the requested DP planning budget.
+#[allow(clippy::too_many_arguments)]
+pub fn align_ner_database_suboptimal_with_dp_memory(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    min_len: u32,
+    max_len: u32,
+    open: Score,
+    threshold: Score,
+    both_strands: bool,
+    memory_mb: usize,
+) -> Result<Vec<Alignment>, ExecutionError> {
+    let ir = model::ner(min_len, max_len, open);
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.extend(align_model_ir_suboptimal_pair_with_dp_memory(
+                query,
+                target,
+                &ir,
+                scoring,
+                IntronScoring::default(),
+                Strand::Forward,
+                threshold,
+                memory_mb,
+            )?);
+            if both_strands {
+                out.extend(align_model_ir_suboptimal_pair_with_dp_memory(
+                    query,
+                    target,
+                    &ir,
+                    scoring,
+                    IntronScoring::default(),
+                    Strand::Reverse,
+                    threshold,
+                    memory_mb,
+                )?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn align_ungapped_translated_database(
     queries: &[Sequence],
     targets: &[Sequence],
@@ -3967,6 +5570,51 @@ pub fn align_ungapped_translated_database(
     out
 }
 
+/// Exact translated ungapped alignment with a checked generic DP budget.
+pub fn align_ungapped_translated_database_with_dp_memory(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    both_strands: bool,
+    memory_mb: usize,
+) -> Result<Vec<Alignment>, ExecutionError> {
+    let ir = model::ungapped_translated(model::Scope::Anywhere);
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.push(align_model_ir_with_dp_memory(
+                query,
+                target,
+                &ir,
+                scoring,
+                Strand::Forward,
+                memory_mb,
+            )?);
+            if both_strands {
+                let reverse_query = Sequence {
+                    id: query.id.clone(),
+                    bases: reverse_complement(&query.bases),
+                };
+                let mut reverse = align_model_ir_with_dp_memory(
+                    &reverse_query,
+                    target,
+                    &ir,
+                    scoring,
+                    Strand::Forward,
+                    memory_mb,
+                )?;
+                let start = query.bases.len() as u64 - reverse.query_start;
+                let end = query.bases.len() as u64 - reverse.query_end;
+                reverse.query_start = start;
+                reverse.query_end = end;
+                reverse.query_strand = Strand::Reverse;
+                out.push(reverse);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub fn align_ner_database(
     queries: &[Sequence],
     targets: &[Sequence],
@@ -3993,6 +5641,45 @@ pub fn align_ner_database(
         }
     }
     out
+}
+
+/// Exact NER database alignment with a checked generic DP budget.
+#[allow(clippy::too_many_arguments)]
+pub fn align_ner_database_with_dp_memory(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    scoring: Scoring,
+    min_len: u32,
+    max_len: u32,
+    open: Score,
+    both_strands: bool,
+    memory_mb: usize,
+) -> Result<Vec<Alignment>, ExecutionError> {
+    let ir = model::ner(min_len, max_len, open);
+    let mut out = Vec::new();
+    for query in queries {
+        for target in targets {
+            out.push(align_model_ir_with_dp_memory(
+                query,
+                target,
+                &ir,
+                scoring,
+                Strand::Forward,
+                memory_mb,
+            )?);
+            if both_strands {
+                out.push(align_model_ir_with_dp_memory(
+                    query,
+                    target,
+                    &ir,
+                    scoring,
+                    Strand::Reverse,
+                    memory_mb,
+                )?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub fn align_est2genome_database(
@@ -4803,7 +6490,7 @@ fn align_suboptimal_pair(
     let mut forbidden = HashSet::new();
     let mut out = Vec::new();
     loop {
-        let alignment = align_with_scorer_forbidden(
+        let alignment = align_with_scorer_forbidden_tie_break(
             query,
             target,
             model,
@@ -4811,6 +6498,7 @@ fn align_suboptimal_pair(
             Strand::Forward,
             dna_score,
             Some(&forbidden),
+            model == Model::BestFit,
         );
         if alignment.score < threshold || alignment.score <= 0 {
             break;
@@ -4836,15 +6524,36 @@ pub fn align_database_suboptimal(
     threshold: Score,
     both_strands: bool,
 ) -> Vec<Alignment> {
+    align_database_affine_suboptimal(
+        queries,
+        targets,
+        Model::Local,
+        scoring,
+        threshold,
+        both_strands,
+    )
+}
+
+/// Pair-disjoint affine alignments for any affine boundary scope. `Global`
+/// naturally produces at most one positive path, while the remaining scopes
+/// may yield further paths after matched pairs are excluded.
+pub fn align_database_affine_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    model: Model,
+    scoring: Scoring,
+    threshold: Score,
+    both_strands: bool,
+) -> Vec<Alignment> {
+    debug_assert!(matches!(
+        model,
+        Model::Global | Model::BestFit | Model::Local | Model::Overlap
+    ));
     let mut out = Vec::new();
     for query in queries {
         for target in targets {
             out.extend(align_suboptimal_pair(
-                query,
-                target,
-                Model::Local,
-                scoring,
-                threshold,
+                query, target, model, scoring, threshold,
             ));
             if both_strands {
                 let reverse_query = Sequence {
@@ -4852,7 +6561,7 @@ pub fn align_database_suboptimal(
                     bases: reverse_complement(&query.bases),
                 };
                 for mut alignment in
-                    align_suboptimal_pair(&reverse_query, target, Model::Local, scoring, threshold)
+                    align_suboptimal_pair(&reverse_query, target, model, scoring, threshold)
                 {
                     alignment.query_start = query.bases.len() as u64 - alignment.query_start;
                     alignment.query_end = query.bases.len() as u64 - alignment.query_end;
@@ -4930,17 +6639,34 @@ pub fn align_protein_suboptimal(
     scoring: Scoring,
     threshold: Score,
 ) -> Vec<Alignment> {
+    align_protein_affine_suboptimal(query, target, Model::Local, scoring, threshold)
+}
+
+/// Waterman--Eggert-style pair-disjoint protein affine alignments for the
+/// requested boundary scope.
+pub fn align_protein_affine_suboptimal(
+    query: &Sequence,
+    target: &Sequence,
+    model: Model,
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
+    debug_assert!(matches!(
+        model,
+        Model::Global | Model::BestFit | Model::Local | Model::Overlap
+    ));
     let mut forbidden = HashSet::new();
     let mut out = Vec::new();
     loop {
-        let mut alignment = align_with_scorer_forbidden(
+        let mut alignment = align_with_scorer_forbidden_tie_break(
             query,
             target,
-            Model::Local,
+            model,
             scoring,
             Strand::Forward,
             protein_score,
             Some(&forbidden),
+            model == Model::BestFit,
         );
         alignment.query_strand = Strand::Unknown;
         alignment.target_strand = Strand::Unknown;
@@ -4967,10 +6693,23 @@ pub fn align_protein_database_suboptimal(
     scoring: Scoring,
     threshold: Score,
 ) -> Vec<Alignment> {
+    align_protein_database_affine_suboptimal(queries, targets, Model::Local, scoring, threshold)
+}
+
+/// Database wrapper for pair-disjoint protein affine alignments.
+pub fn align_protein_database_affine_suboptimal(
+    queries: &[Sequence],
+    targets: &[Sequence],
+    model: Model,
+    scoring: Scoring,
+    threshold: Score,
+) -> Vec<Alignment> {
     let mut out = Vec::new();
     for query in queries {
         for target in targets {
-            out.extend(align_protein_suboptimal(query, target, scoring, threshold));
+            out.extend(align_protein_affine_suboptimal(
+                query, target, model, scoring, threshold,
+            ));
         }
     }
     out
@@ -5343,6 +7082,36 @@ where
         }
     }
     out
+}
+
+fn try_enumerate_suboptimal_pair<F>(
+    query: &Sequence,
+    target: &Sequence,
+    threshold: Score,
+    mut aligner: F,
+) -> Result<Vec<Alignment>, ExecutionError>
+where
+    F: FnMut(&HashSet<(usize, usize)>) -> Result<Alignment, ExecutionError>,
+{
+    let mut forbidden = HashSet::new();
+    let mut out = Vec::new();
+    loop {
+        let alignment = aligner(&forbidden)?;
+        if alignment.score < threshold || alignment.score <= 0 {
+            break;
+        }
+        let added = forbid_alignment_pairs(
+            &alignment,
+            query.bases.len(),
+            target.bases.len(),
+            &mut forbidden,
+        );
+        out.push(alignment);
+        if added == 0 {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// Waterman-Eggert-style pair-disjoint suboptimal coding alignments.
@@ -7304,6 +9073,7 @@ fn align_genome_to_genome_forbidden(
     traceback_start_sink: Option<&mut (usize, usize, GenomeState)>,
     mut checkpoint_sink: Option<&mut Vec<GenomeCheckpoint>>,
     checkpoint_stride: usize,
+    replay_checkpoint: Option<&GenomeCheckpoint>,
 ) -> Alignment {
     let intron = canonical_intron_scoring(intron);
     let (n, m, cols) = (
@@ -7374,12 +9144,26 @@ fn align_genome_to_genome_forbidden(
     let mut pu3i = parent_matrix();
     let mut pu3d = parent_matrix();
     let mut queues = GenomeIntronQueues::new(m + 1);
+    let mut first_compute_row = 0;
+    if let Some(checkpoint) = replay_checkpoint {
+        restore_genome_checkpoint_scores(
+            checkpoint, &mut mat, &mut ins, &mut del, &mut cm, &mut ci, &mut cd, &mut u3m,
+            &mut u3i, &mut u3d,
+        );
+        queues = restore_genome_checkpoint_queues(checkpoint);
+        first_compute_row = checkpoint.row.saturating_add(1);
+    }
     let mut end = (0usize, 0usize, GenomeState::UtrM, 0);
     let min_len = intron.min_len as usize;
     let max_len = intron.max_len as usize;
     debug_assert!(genome_checkpoint_history_rows(intron) > min_len + 3);
 
-    for i in 0..=n {
+    // Replay must retain the complete query so splice-site kernels can inspect
+    // bases beyond the forced endpoint.  Limit only the rows being evaluated;
+    // truncating the sequence changes donor/acceptor PSSM scores at a block
+    // boundary.
+    let last_compute_row = forced_end.map_or(n, |endpoint| endpoint.0.min(n));
+    for i in first_compute_row..=last_compute_row {
         mat.start_row(i, 0);
         ins.start_row(i, NEG_INF);
         del.start_row(i, NEG_INF);
@@ -8754,7 +10538,7 @@ fn align_genome_to_genome_forbidden(
             }
         }
         if let Some(checkpoints) = checkpoint_sink.as_deref_mut() {
-            if i % checkpoint_stride.max(1) == 0 || i == n {
+            if i % checkpoint_stride.max(1) == 0 || i == last_compute_row {
                 let first_row = i + 1 - genome_checkpoint_history_rows(intron).min(i + 1);
                 let history = (first_row..=i)
                     .map(|row| GenomeScoreRow {
@@ -8901,16 +10685,15 @@ pub fn align_genome_to_genome(
     intron: IntronScoring,
 ) -> Alignment {
     align_genome_to_genome_forbidden(
-        query, target, scoring, intron, None, false, None, None, None, None, 1,
+        query, target, scoring, intron, None, false, None, None, None, None, 1, None,
     )
 }
 
 /// Exact low-memory traceback for genome-to-genome.  The forward endpoint is
 /// found with rolling scores and no resident parent matrix; traceback then
-/// recomputes one parent-row block at a time.  Query/joint intron queues are
-/// rebuilt from the prefix for every block, which is slower than restoring
-/// the saved queue checkpoints but keeps memory bounded and preserves the
-/// exact recurrence while that faster restoration path is completed.
+/// recomputes one parent-row block at a time from saved score and intron-queue
+/// checkpoints.  This avoids re-running the prefix for every block while
+/// preserving the exact recurrence and bounded memory plan.
 fn align_genome_to_genome_checkpointed(
     query: &Sequence,
     target: &Sequence,
@@ -8918,6 +10701,19 @@ fn align_genome_to_genome_checkpointed(
     intron: IntronScoring,
     budget_bytes: Option<u128>,
 ) -> Alignment {
+    let block_rows = budget_bytes
+        .map(|budget| {
+            genome_checkpoint_plan(query.bases.len(), target.bases.len(), intron, Some(budget))
+                .stride
+        })
+        .unwrap_or(64)
+        .max(genome_checkpoint_history_rows(intron))
+        .min(query.bases.len().max(1));
+    // The planner's stride denotes the number of rows between snapshots. A
+    // replay block retains both endpoints, hence it may hold `stride + 1`
+    // parent rows, exactly as accounted for by `genome_checkpoint_plan`.
+    let checkpoint_stride = block_rows.max(1);
+    let mut checkpoints = Vec::new();
     let mut endpoint_state = (0, 0, GenomeState::UtrM);
     let endpoint = align_genome_to_genome_forbidden(
         query,
@@ -8929,8 +10725,9 @@ fn align_genome_to_genome_checkpointed(
         Some((0, 0)),
         None,
         Some(&mut endpoint_state),
+        Some(&mut checkpoints),
+        checkpoint_stride,
         None,
-        1,
     );
     let final_state = endpoint_state.2;
     let mut cursor = (
@@ -8938,25 +10735,21 @@ fn align_genome_to_genome_checkpointed(
         endpoint.target_end as usize,
         final_state,
     );
-    let block_rows = budget_bytes
-        .map(|budget| {
-            genome_checkpoint_plan(query.bases.len(), target.bases.len(), intron, Some(budget))
-                .stride
-        })
-        .unwrap_or(64)
-        .max(genome_checkpoint_history_rows(intron))
-        .min(query.bases.len().max(1));
     let mut trace_segments = Vec::new();
     let mut raw_segments = Vec::new();
     loop {
-        let first_row = cursor.0.saturating_sub(block_rows.saturating_sub(1));
-        let prefix = Sequence {
-            id: query.id.clone(),
-            bases: query.bases[..cursor.0].to_vec(),
-        };
+        if cursor.0 == 0 {
+            break;
+        }
+        let checkpoint = checkpoints
+            .iter()
+            .rev()
+            .find(|checkpoint| checkpoint.row < cursor.0)
+            .expect("row zero checkpoint precedes every nonzero cursor");
+        let first_row = checkpoint.row;
         let mut start = cursor;
         let segment = align_genome_to_genome_forbidden(
-            &prefix,
+            query,
             target,
             scoring,
             intron,
@@ -8967,6 +10760,7 @@ fn align_genome_to_genome_checkpointed(
             Some(&mut start),
             None,
             1,
+            Some(checkpoint),
         );
         let terminal_len = 2 + usize::from(genome_terminal_transition(cursor.2).is_some());
         debug_assert!(segment.raw_trace.len() > terminal_len);
@@ -9054,7 +10848,7 @@ fn align_genome_to_genome_memory_aware(
         align_genome_to_genome_checkpointed(query, target, scoring, intron, budget_bytes)
     } else {
         align_genome_to_genome_forbidden(
-            query, target, scoring, intron, None, false, None, None, None, None, 1,
+            query, target, scoring, intron, None, false, None, None, None, None, 1, None,
         )
     }
 }
@@ -9088,6 +10882,7 @@ pub fn align_genome_to_genome_suboptimal(
             None,
             None,
             1,
+            None,
         )
     })
 }
@@ -11507,6 +13302,36 @@ mod tests {
     }
 
     #[test]
+    fn affine_overlap_suboptimal_preserves_its_boundary_scope() {
+        let query = s("q", "ACGTTGCA");
+        let target = s("t", "TTACGTTGCATT");
+        let alignments = align_database_affine_suboptimal(
+            std::slice::from_ref(&query),
+            std::slice::from_ref(&target),
+            Model::Overlap,
+            Scoring::default(),
+            0,
+            false,
+        );
+        assert!(alignments.len() >= 2, "{alignments:?}");
+        assert!(alignments.iter().all(|alignment| {
+            alignment.query_end == query.bases.len() as u64
+                || alignment.target_end == target.bases.len() as u64
+        }));
+        let mut forbidden = HashSet::new();
+        for alignment in &alignments {
+            assert!(
+                forbid_alignment_pairs(
+                    alignment,
+                    query.bases.len(),
+                    target.bases.len(),
+                    &mut forbidden,
+                ) > 0
+            );
+        }
+    }
+
+    #[test]
     fn codon_match_suboptimal_exclusion_blocks_each_nucleotide_pair() {
         let alignment = Alignment {
             query_id: "query".into(),
@@ -11607,6 +13432,116 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn generic_table_size_rejects_overflow_before_allocation() {
+        assert_eq!(
+            generic_table_slots(usize::MAX, 1, 1),
+            Err(ExecutionError::AllocationOverflow)
+        );
+        assert_eq!(
+            generic_table_slots(usize::MAX / 2, 1, 2),
+            Err(ExecutionError::AllocationOverflow)
+        );
+        assert_eq!(generic_table_slots(2, 3, 4), Ok(48));
+    }
+
+    #[test]
+    fn generic_score_checkpoint_restores_an_overwritten_ring_row() {
+        let mut matrix = GenericScoreMatrix::rolling(3, 2, 2).expect("small rolling matrix");
+        matrix.set(0, 2, 1, 17);
+        let checkpoint = matrix.checkpoint_row(0).expect("checkpoint row");
+        matrix.clear_row(2);
+        matrix.set(2, 2, 1, 99);
+        assert_eq!(
+            matrix.get(0, 2, 1),
+            NEG_INF,
+            "a tagged ring must not expose the reused row as row zero"
+        );
+        matrix.restore_row(&checkpoint);
+        assert_eq!(matrix.get(0, 2, 1), 17);
+        assert_eq!(checkpoint.row, 0);
+    }
+
+    #[test]
+    fn generic_shadow_checkpoint_restores_an_overwritten_ring_row() {
+        let mut matrix = GenericShadowMatrix::rolling(3, 2, 2).expect("small rolling matrix");
+        matrix.set(
+            0,
+            2,
+            1,
+            GenericCellShadow {
+                phase_donor: Some((4, 7)),
+            },
+        );
+        let checkpoint = matrix.checkpoint_row(0).expect("checkpoint row");
+        matrix.clear_row(2);
+        matrix.set(
+            2,
+            2,
+            1,
+            GenericCellShadow {
+                phase_donor: Some((9, 11)),
+            },
+        );
+        assert_eq!(
+            matrix.get(0, 2, 1).phase_donor,
+            None,
+            "a tagged ring must not expose the reused row as row zero"
+        );
+        matrix.restore_row(&checkpoint);
+        assert_eq!(matrix.get(0, 2, 1).phase_donor, Some((4, 7)));
+        assert_eq!(checkpoint.row, 0);
+    }
+
+    #[test]
+    fn generic_checkpoint_restores_history_shadows_and_long_state() {
+        let mut scores = GenericScoreMatrix::rolling(2, 1, 3).expect("score ring");
+        let mut shadows = GenericShadowMatrix::rolling(2, 1, 3).expect("shadow ring");
+        let mut payload =
+            GenericLongStatePayload::try_allocate(1, 0, 0, 3).expect("long-state payload");
+        for row in 0..=2 {
+            scores.set(row, 1, 0, row as Score + 10);
+        }
+        shadows.set(
+            2,
+            1,
+            0,
+            GenericCellShadow {
+                phase_donor: Some((1, 2)),
+            },
+        );
+        payload.ner_columns[0][1].insert(JointIntronCandidate {
+            query_start: 1,
+            target_start: 2,
+            score: 13,
+            state_rank: 0,
+        });
+        let parents = GenericParentMatrix::rolling(2, 1, 3).expect("parent ring");
+        let checkpoint =
+            GenericCheckpoint::capture(2, 2, 0, 2, &scores, &shadows, &parents, &payload)
+                .expect("checkpoint");
+
+        for row in 3..=5 {
+            scores.clear_row(row);
+            shadows.clear_row(row);
+        }
+        payload.ner_columns[0][1].entries.clear();
+        let mut restored_parents = GenericParentMatrix::rolling(2, 1, 3).expect("parent ring");
+        let restored_payload = checkpoint.restore(&mut scores, &mut shadows, &mut restored_parents);
+
+        assert_eq!(checkpoint.row, 2);
+        assert_eq!(scores.get(0, 1, 0), 10);
+        assert_eq!(scores.get(1, 1, 0), 11);
+        assert_eq!(scores.get(2, 1, 0), 12);
+        assert_eq!(shadows.get(2, 1, 0).phase_donor, Some((1, 2)));
+        assert_eq!(
+            restored_payload.ner_columns[0][1]
+                .best()
+                .map(|candidate| candidate.score),
+            Some(13)
+        );
     }
 
     #[test]
@@ -11980,6 +13915,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         );
         assert_eq!(rolling.score, full.score);
         assert_eq!(rolling.sugar(), full.sugar());
@@ -12069,6 +14005,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         );
         assert_eq!(blocked.score, full.score);
         assert_eq!(blocked.query_end, full.query_end);
@@ -12091,6 +14028,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         );
         assert_eq!(replayed_block.score, full.score);
         assert_eq!(replayed_block.query_end, full.query_end);
@@ -12131,6 +14069,7 @@ mod tests {
             None,
             Some(&mut checkpoints),
             17,
+            None,
         );
         assert!(rolling.score > 0);
         assert_eq!(
@@ -12171,6 +14110,19 @@ mod tests {
         assert_eq!(u5m.row_clone(final_row.row), final_row.u5m);
         assert_eq!(cm.row_clone(final_row.row), final_row.cm);
         assert_eq!(u3d.row_clone(final_row.row), final_row.u3d);
+
+        let checkpointed = align_genome_to_genome_checkpointed(
+            &query,
+            &target,
+            Scoring::default(),
+            intron,
+            Some(0),
+        );
+        assert_eq!(checkpointed.score, rolling.score);
+        assert_eq!(checkpointed.sugar(), rolling.sugar());
+        assert_eq!(checkpointed.cigar(), rolling.cigar());
+        assert_eq!(checkpointed.vulgar(), rolling.vulgar());
+        assert_eq!(checkpointed.raw_trace, rolling.raw_trace);
     }
 
     #[test]
@@ -13600,6 +15552,146 @@ mod tests {
     }
 
     #[test]
+    fn generic_checkpoint_matches_full_query_target_and_joint_introns() {
+        let exon = "ACGT".repeat(10);
+        let query_intron = s(
+            "query",
+            &format!("{}GT{}AG{}", &exon[..20], "N".repeat(30), &exon[20..]),
+        );
+        let target_intron = s(
+            "target",
+            &format!("{}GT{}AG{}", &exon[..20], "N".repeat(40), &exon[20..]),
+        );
+        let plain_query = s("query", &exon);
+        let plain_target = s("target", &exon);
+        let intron = IntronScoring {
+            open_penalty: -1,
+            force_gtag: true,
+            ..IntronScoring::default()
+        };
+        for (query, target, ir) in [
+            (
+                &query_intron,
+                &plain_target,
+                model::query_intron(30, 200_000),
+            ),
+            (&plain_query, &target_intron, model::est2genome(30, 200_000)),
+            (
+                &query_intron,
+                &target_intron,
+                model::joint_intron(30, 200_000),
+            ),
+        ] {
+            let full = align_model_ir_with_intron(
+                query,
+                target,
+                &ir,
+                Scoring::default(),
+                intron,
+                Strand::Forward,
+            )
+            .expect("full generic intron alignment");
+            let checkpointed = align_model_ir_checkpointed(
+                query,
+                target,
+                &ir,
+                Scoring::default(),
+                intron,
+                Strand::Forward,
+                0,
+                None,
+            )
+            .expect("checkpoint generic intron alignment");
+            assert_eq!(checkpointed.score, full.score);
+            assert_eq!(checkpointed.trace, full.trace);
+            assert_eq!(checkpointed.raw_trace, full.raw_trace);
+            assert_eq!(
+                (
+                    checkpointed.query_start,
+                    checkpointed.query_end,
+                    checkpointed.target_start,
+                    checkpointed.target_end
+                ),
+                (
+                    full.query_start,
+                    full.query_end,
+                    full.target_start,
+                    full.target_end
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn generic_checkpoint_preserves_zero_score_raw_traceback() {
+        let query = s("query", "AAAAAAAAAAAA");
+        let target = s("target", "TTTTTTTTTTTT");
+        let ir = model::ner(10, 50_000, -20);
+        let full = align_model_ir(&query, &target, &ir, Scoring::default(), Strand::Forward)
+            .expect("full generic NER alignment");
+        let checkpointed = align_model_ir_checkpointed(
+            &query,
+            &target,
+            &ir,
+            Scoring::default(),
+            IntronScoring::default(),
+            Strand::Forward,
+            0,
+            None,
+        )
+        .expect("checkpoint generic NER alignment");
+        assert_eq!(checkpointed.score, 0);
+        assert_eq!(checkpointed.trace, full.trace);
+        assert_eq!(checkpointed.raw_trace, full.raw_trace);
+    }
+
+    #[test]
+    fn generic_checkpoint_plan_accounts_for_long_state_snapshots() {
+        let ir = model::ner(10, 50_000, -20);
+        let (stride, peak_bytes) =
+            generic_checkpoint_plan(500, 500, &ir, Some(0)).expect("checkpoint plan");
+        let full_bytes = generic_full_dp_bytes(500, 500, &ir).expect("full plan");
+        assert!(stride > 1);
+        assert!(
+            peak_bytes <= full_bytes,
+            "minimum checkpoint plan {peak_bytes} exceeded full table {full_bytes}"
+        );
+    }
+
+    #[test]
+    fn genome_checkpoint_replay_uses_full_splice_context() {
+        let prefix = "ACGT".repeat(2)[..6].to_owned();
+        let tail = "TGCA".repeat(30);
+        let query = s("query", &format!("{prefix}GT{}AG{tail}", "N".repeat(6)));
+        let target = s("target", &format!("{prefix}GT{}AG{tail}", "N".repeat(8)));
+        let intron = IntronScoring {
+            min_len: 6,
+            max_len: 20,
+            open_penalty: -1,
+            force_gtag: true,
+        };
+        let full = align_genome_to_genome(&query, &target, Scoring::default(), intron);
+        let checkpointed = align_genome_to_genome_checkpointed(
+            &query,
+            &target,
+            Scoring::default(),
+            intron,
+            Some(0),
+        );
+        assert_eq!(checkpointed.score, full.score);
+        assert_eq!(checkpointed.trace, full.trace);
+        assert_eq!(checkpointed.raw_trace, full.raw_trace);
+        assert_eq!(
+            checkpointed
+                .raw_trace
+                .iter()
+                .map(|step| step.score)
+                .sum::<Score>(),
+            checkpointed.score
+        );
+    }
+
+    #[test]
     fn generic_c4_executor_matches_specialized_affine_scopes() {
         let query = s("query", "ACGTTGCA");
         let target = s("target", "TTACGTCGCAAA");
@@ -13631,6 +15723,296 @@ mod tests {
             );
             assert_eq!(actual.cigar(), expected.cigar(), "{model:?}");
         }
+    }
+
+    #[test]
+    fn generic_c4_affine_ir_uses_checkpoint_backend_under_zero_budget() {
+        let query = s("query", &"ACGT".repeat(45));
+        let target = s(
+            "target",
+            &format!("{}{}", "N".repeat(23), "ACGT".repeat(45)),
+        );
+        for model in [Model::Global, Model::BestFit, Model::Local, Model::Overlap] {
+            let expected = align_model_ir(
+                &query,
+                &target,
+                &model.ir(),
+                Scoring::default(),
+                Strand::Forward,
+            )
+            .expect("finite affine IR must execute");
+            let actual = align_model_ir_with_dp_memory(
+                &query,
+                &target,
+                &model.ir(),
+                Scoring::default(),
+                Strand::Forward,
+                0,
+            )
+            .expect("built-in affine IR must use checkpoint traceback");
+            assert_eq!(actual.score, expected.score, "{model:?}");
+            assert_eq!(actual.cigar(), expected.cigar(), "{model:?}");
+            assert_eq!(actual.raw_trace, expected.raw_trace, "{model:?}");
+        }
+    }
+
+    #[test]
+    fn generic_c4_translated_ungapped_uses_linear_memory_under_zero_budget() {
+        let query = s("query", "CGATCAGCTAGCTAGCTACGATCGATCGAT");
+        let target = s("target", "CGATACGATCGCTCTGAGATCTCGACTCAG");
+        let ir = model::ungapped_translated(model::Scope::Anywhere);
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let full = align_model_ir(&query, &target, &ir, Scoring::default(), strand)
+                .expect("translated IR must execute");
+            let linear =
+                align_model_ir_with_dp_memory(&query, &target, &ir, Scoring::default(), strand, 0)
+                    .expect("translated IR has a linear-memory backend");
+            assert_eq!(linear.score, full.score, "{strand:?}");
+            assert_eq!(linear.trace, full.trace, "{strand:?}");
+            assert_eq!(linear.raw_trace, full.raw_trace, "{strand:?}");
+            assert_eq!(
+                (
+                    linear.query_start,
+                    linear.query_end,
+                    linear.target_start,
+                    linear.target_end
+                ),
+                (
+                    full.query_start,
+                    full.query_end,
+                    full.target_start,
+                    full.target_end
+                ),
+                "{strand:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_c4_dna_ungapped_uses_linear_memory_under_zero_budget() {
+        let query = s("query", "TTACGTTGCA");
+        let target = s("target", "GGACGTCGCAAA");
+        let ir = model::ungapped(model::Scope::Anywhere);
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let full = align_model_ir(&query, &target, &ir, Scoring::default(), strand)
+                .expect("DNA ungapped IR must execute");
+            let linear =
+                align_model_ir_with_dp_memory(&query, &target, &ir, Scoring::default(), strand, 0)
+                    .expect("DNA ungapped IR has a linear-memory backend");
+            assert_eq!(linear.score, full.score, "{strand:?}");
+            assert_eq!(linear.trace, full.trace, "{strand:?}");
+            assert_eq!(linear.raw_trace, full.raw_trace, "{strand:?}");
+            assert_eq!(
+                (
+                    linear.query_start,
+                    linear.query_end,
+                    linear.target_start,
+                    linear.target_end
+                ),
+                (
+                    full.query_start,
+                    full.query_end,
+                    full.target_start,
+                    full.target_end
+                ),
+                "{strand:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_c4_dna_ungapped_linear_matches_all_short_sequences() {
+        let mut sequences = Vec::new();
+        for length in 1..=3 {
+            for mut code in 0..4usize.pow(length) {
+                let mut bases = vec![b'A'; length as usize];
+                for base in &mut bases {
+                    *base = b"ACGT"[code % 4];
+                    code /= 4;
+                }
+                sequences.push(Sequence {
+                    id: "s".into(),
+                    bases,
+                });
+            }
+        }
+        let ir = model::ungapped(model::Scope::Anywhere);
+        for query in &sequences {
+            for target in &sequences {
+                for strand in [Strand::Forward, Strand::Reverse] {
+                    let full = align_model_ir(query, target, &ir, Scoring::default(), strand)
+                        .expect("small ungapped IR must execute");
+                    let linear = align_model_ir_with_dp_memory(
+                        query,
+                        target,
+                        &ir,
+                        Scoring::default(),
+                        strand,
+                        0,
+                    )
+                    .expect("small ungapped IR has a linear backend");
+                    assert_eq!(linear.score, full.score, "{query:?} {target:?} {strand:?}");
+                    assert_eq!(linear.trace, full.trace, "{query:?} {target:?} {strand:?}");
+                    assert_eq!(
+                        linear.raw_trace, full.raw_trace,
+                        "{query:?} {target:?} {strand:?}"
+                    );
+                    assert_eq!(
+                        (
+                            linear.query_start,
+                            linear.query_end,
+                            linear.target_start,
+                            linear.target_end
+                        ),
+                        (
+                            full.query_start,
+                            full.query_end,
+                            full.target_start,
+                            full.target_end
+                        ),
+                        "{query:?} {target:?} {strand:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generic_c4_long_state_uses_checkpoint_traceback_under_zero_budget() {
+        let query = s("query", "ACGTACGTACGT");
+        let target = s("target", "AACGTACGTTGC");
+        let ir = model::ner(4, 20, -5);
+        for strand in [Strand::Forward, Strand::Reverse] {
+            let checkpointed =
+                align_model_ir_with_dp_memory(&query, &target, &ir, Scoring::default(), strand, 0)
+                    .expect("generic long-state IR must use checkpoint traceback");
+            let full = align_model_ir(&query, &target, &ir, Scoring::default(), strand)
+                .expect("small NER IR must execute with its complete table");
+            assert_eq!(checkpointed.score, full.score, "{strand:?}");
+            assert_eq!(checkpointed.trace, full.trace, "{strand:?}");
+            assert_eq!(checkpointed.raw_trace, full.raw_trace, "{strand:?}");
+            assert_eq!(
+                (checkpointed.target_start, checkpointed.target_end),
+                (full.target_start, full.target_end),
+                "{strand:?}"
+            );
+        }
+        let full = align_model_ir(&query, &target, &ir, Scoring::default(), Strand::Forward)
+            .expect("small NER IR must execute with its complete table");
+        let budgeted = align_model_ir_with_dp_memory(
+            &query,
+            &target,
+            &ir,
+            Scoring::default(),
+            Strand::Forward,
+            1,
+        )
+        .expect("a fitting generic table must retain the full executor");
+        assert_eq!(budgeted.score, full.score);
+        assert_eq!(budgeted.raw_trace, full.raw_trace);
+    }
+
+    #[test]
+    fn generic_suboptimal_checkpoint_matches_full_enumeration() {
+        let queries = [s("query", "ACGTACGTACGT")];
+        let targets = [s("target", "ACGTACGTACGT")];
+        let full_ner = align_ner_database_suboptimal(
+            &queries,
+            &targets,
+            Scoring::default(),
+            4,
+            20,
+            -5,
+            1,
+            false,
+        );
+        let checkpoint_ner = align_ner_database_suboptimal_with_dp_memory(
+            &queries,
+            &targets,
+            Scoring::default(),
+            4,
+            20,
+            -5,
+            1,
+            false,
+            0,
+        )
+        .expect("NER checkpoint enumeration");
+        assert_eq!(checkpoint_ner.len(), full_ner.len());
+        for (checkpointed, full) in checkpoint_ner.iter().zip(&full_ner) {
+            assert_eq!(checkpointed.sugar(), full.sugar());
+            assert_eq!(checkpointed.raw_trace, full.raw_trace);
+        }
+
+        let full_translated = align_ungapped_translated_database_suboptimal(
+            &queries,
+            &targets,
+            Scoring::default(),
+            1,
+            false,
+        );
+        let checkpoint_translated = align_ungapped_translated_database_suboptimal_with_dp_memory(
+            &queries,
+            &targets,
+            Scoring::default(),
+            1,
+            false,
+            0,
+        )
+        .expect("translated checkpoint enumeration");
+        assert_eq!(checkpoint_translated.len(), full_translated.len());
+        for (checkpointed, full) in checkpoint_translated.iter().zip(&full_translated) {
+            assert_eq!(checkpointed.sugar(), full.sugar());
+            assert_eq!(checkpointed.raw_trace, full.raw_trace);
+        }
+    }
+
+    #[test]
+    fn generic_c4_budget_accounts_for_persistent_long_state_queues() {
+        let affine = model::affine(model::Scope::Anywhere);
+        let ner = model::ner(4, 20, -5);
+        let affine_bytes = generic_full_dp_bytes(12, 12, &affine).expect("small affine plan");
+        let ner_bytes = generic_full_dp_bytes(12, 12, &ner).expect("small NER plan");
+        assert!(ner_bytes > affine_bytes);
+    }
+
+    #[test]
+    fn generic_c4_long_state_payload_snapshot_is_independent() {
+        let mut payload =
+            GenericLongStatePayload::try_allocate(1, 1, 1, 2).expect("small payload allocation");
+        payload.ner_columns[0][0].insert(JointIntronCandidate {
+            query_start: 3,
+            target_start: 4,
+            score: 5,
+            state_rank: 1,
+        });
+        payload.joint_columns[0][1].insert(JointIntronCandidate {
+            query_start: 6,
+            target_start: 7,
+            score: 8,
+            state_rank: 2,
+        });
+        payload.query_windows[0][0].insert(IntronCandidate {
+            start: 9,
+            score: 10,
+            state_rank: 3,
+        });
+        let snapshot = payload.clone();
+        payload.ner_columns[0][0].entries.clear();
+        payload.joint_columns[0][1].entries.clear();
+        payload.query_windows[0][0].entries.clear();
+        assert_eq!(
+            snapshot.ner_columns[0][0].best().map(|entry| entry.score),
+            Some(5)
+        );
+        assert_eq!(
+            snapshot.joint_columns[0][1].best().map(|entry| entry.score),
+            Some(8)
+        );
+        assert_eq!(
+            snapshot.query_windows[0][0].best().map(|entry| entry.score),
+            Some(10)
+        );
     }
 
     #[test]
@@ -13782,6 +16164,20 @@ mod tests {
                 Strand::Forward,
             )
             .expect("target phase long state must compile");
+            let checkpointed = align_model_ir_checkpointed(
+                &query,
+                &target,
+                &model::protein_phase_intron(30, 200_000),
+                Scoring::default(),
+                intron,
+                Strand::Forward,
+                0,
+                None,
+            )
+            .expect("target phase checkpoint must compile");
+            assert_eq!(checkpointed.score, actual.score, "phase {phase}");
+            assert_eq!(checkpointed.trace, actual.trace, "phase {phase}");
+            assert_eq!(checkpointed.raw_trace, actual.raw_trace, "phase {phase}");
             assert_eq!(actual.score, expected.score, "phase {phase}");
             assert_eq!(
                 (
@@ -14161,6 +16557,19 @@ mod tests {
                 .any(|run| run.op == Op::SplitCodon)
         );
         assert!(query_alignment.trace.iter().any(|run| run.op == Op::Intron));
+        let query_checkpoint = align_model_ir_checkpointed(
+            &query,
+            &compact_target,
+            &query_ir,
+            Scoring::default(),
+            intron,
+            Strand::Forward,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(query_checkpoint.trace, query_alignment.trace);
+        assert_eq!(query_checkpoint.raw_trace, query_alignment.raw_trace);
 
         let mut joint_ir = model::joint_codon_phase_intron(6, 6);
         joint_ir.scope = model::Scope::Query;
@@ -14185,6 +16594,19 @@ mod tests {
                 .any(|run| run.op == Op::SplitCodon)
         );
         assert!(joint_alignment.trace.iter().any(|run| run.op == Op::Intron));
+        let joint_checkpoint = align_model_ir_checkpointed(
+            &query,
+            &intron_target,
+            &joint_ir,
+            Scoring::default(),
+            intron,
+            Strand::Forward,
+            0,
+            None,
+        )
+        .unwrap();
+        assert_eq!(joint_checkpoint.trace, joint_alignment.trace);
+        assert_eq!(joint_checkpoint.raw_trace, joint_alignment.raw_trace);
     }
 
     #[test]
