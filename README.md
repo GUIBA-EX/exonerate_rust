@@ -2,33 +2,76 @@
 
 [![CI](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml)
 
-Exonerate 2.4.0 的 Rust 重实现。目标是在保持得分、坐标、路径和主要
-CLI 输出兼容的前提下，提供安全、可测试的精确比对与低内存执行路径。
+Exonerate 2.4.0 的 Rust 重实现。项目以得分、traceback、坐标和主要 CLI
+输出兼容为目标，同时提供精确的低内存执行路径。
 
-## 支持范围
+## 快速开始
 
-- 基础模型：`ungapped`、`ungapped:trans`、`affine:{global,bestfit,local,overlap}`。
-- 生物模型：`ner`、`est2genome`、`protein2dna`、
-  `protein2genome`、`coding2coding`、`coding2genome`、
-  `cdna2genome`、`genome2genome`，以及两个 protein best-fit 变体。
-- DNA、蛋白质、翻译、frameshift、phase 0/1/2 intron、split codon。
-- sugar、cigar、vulgar、pretty alignment、RYO 和项目自有 GFF3。
-- exact DP、启发式候选区域和 checkpoint traceback。
-
-GFF2 不在项目范围内。
-
-## 构建与检查
-
-项目固定使用 Rust 1.87.0：
+需要 Rust 1.87.0；仓库中的 `rust-toolchain.toml` 会自动选择该版本。
 
 ```bash
 git clone --recurse-submodules https://github.com/GUIBA-EX/exonerate_rust.git
 cd exonerate_rust
 cargo build --release --locked
-cargo test --workspace --all-targets --locked
+
+target/release/exonerate-rs --help
+target/release/exonerate-rs \
+  --model affine:local \
+  --verbose 0 \
+  query.fa target.fa
 ```
 
-本地执行与 CI 相同的检查：
+输入为 FASTA 文件。使用 `-q QUERY.fa -t TARGET.fa` 与使用最后两个位置参数
+等价。
+
+## 支持的模型
+
+```text
+ungapped             ungapped:trans
+affine:global        affine:bestfit
+affine:local         affine:overlap
+ner                  est2genome
+protein2dna          protein2dna:bestfit
+protein2genome       protein2genome:bestfit
+coding2coding        coding2genome
+cdna2genome          genome2genome
+```
+
+示例：
+
+```bash
+# 蛋白质到基因组
+target/release/exonerate-rs \
+  --model protein2genome protein.fa genome.fa
+
+# cDNA 到基因组
+target/release/exonerate-rs \
+  --model cdna2genome --minintron 30 cdna.fa genome.fa
+
+# 完整搜索，并在需要时使用 checkpoint traceback
+target/release/exonerate-rs \
+  --model genome2genome \
+  --exhaustive yes \
+  --dpmemory 16 \
+  query.fa target.fa
+```
+
+## 行为约定
+
+- 默认值与 upstream 一致：`--verbose 1`、`--score 100`、`--subopt yes`。
+- `-E` 或 `--exhaustive yes` 跳过启发式候选区域，执行完整搜索。
+- `--dpmemory` 是 DP 规划预算，不是整个进程的 RSS 硬上限；在支持
+  checkpoint 的模型中，设为 `0` 可强制走低内存路径。
+- 支持 sugar、cigar、vulgar、pretty alignment、RYO 和项目自有 GFF3。
+- 内部坐标为零基半开区间；默认输出正向参考坐标。
+- GFF2 不在项目范围内。
+
+完整的模型和参数兼容证据见[兼容范围](COMPATIBILITY.md)与
+[命令行基准覆盖](ORACLE_MATRIX.md)。
+
+## 开发与验证
+
+CI 执行以下检查：
 
 ```bash
 cargo fmt --all -- --check
@@ -38,35 +81,19 @@ cargo test --workspace --doc --locked
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --no-deps --locked
 ```
 
-## 使用
+Linux 上可额外比较 full/checkpoint 的输出和 peak RSS：
 
 ```bash
-# DNA 局部比对
-cargo run --release -p exonerate -- \
-  --model affine:local query.fa target.fa
-
-# 蛋白质到基因组
-cargo run --release -p exonerate -- \
-  --model protein2genome protein.fa genome.fa
-
-# cDNA 到基因组
-cargo run --release -p exonerate -- \
-  --model cdna2genome --minintron 30 cdna.fa genome.fa
-
-# 强制精确 DP，并使用低内存计划
-cargo run --release -p exonerate -- \
-  --model genome2genome --exhaustive yes --dpmemory 16 query.fa target.fa
+scripts/validate_peak_rss.sh
 ```
-
-CLI 默认 `--score 100`、`--subopt yes`。`-E`/`--exhaustive` 强制完整
-DP；`--dpmemory` 是 DP 规划预算，不是进程 RSS 硬上限。内部坐标为
-零基、半开区间；默认报告正向参考坐标。
 
 ## 文档
 
-- [架构](exonerate.md)
-- [兼容范围](COMPATIBILITY.md)
-- [开发状态](DEVELOPMENT_STATUS.md)
-- [命令行基准覆盖](ORACLE_MATRIX.md)
+- [兼容范围](COMPATIBILITY.md)：实现边界与兼容优先级
+- [命令行基准覆盖](ORACLE_MATRIX.md)：各模型的 upstream 证据
+- [架构](exonerate.md)：工作区、数据流和设计不变量
+- [通用 C4 checkpoint 设计](C4_CHECKPOINT_DESIGN.md)：低内存回放设计
+- [DP 内存验证](MEMORY_VALIDATION.md)：预算语义与 RSS 验证
+- [开发状态](DEVELOPMENT_STATUS.md)：当前能力和范围边界
 
-许可证：GPL-3.0-only。
+许可证：[GPL-3.0-only](LICENSE)。

@@ -9,6 +9,7 @@ fn fixture(name: &str) -> PathBuf {
 
 fn run(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_exonerate-rs"))
+        .args(["--verbose", "0"])
         .args(args)
         .output()
         .expect("run exonerate-rs");
@@ -22,6 +23,7 @@ fn run(args: &[&str]) -> String {
 
 fn run_failure(args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_exonerate-rs"))
+        .args(["--verbose", "0"])
         .args(args)
         .output()
         .expect("run exonerate-rs");
@@ -30,6 +32,19 @@ fn run_failure(args: &[&str]) -> String {
         "exonerate-rs unexpectedly succeeded"
     );
     String::from_utf8(output.stderr).expect("CLI stderr is UTF-8")
+}
+
+fn run_with_defaults(args: &[&str]) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_exonerate-rs"))
+        .args(args)
+        .output()
+        .expect("run exonerate-rs");
+    assert!(
+        output.status.success(),
+        "exonerate-rs failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("CLI output is UTF-8")
 }
 
 #[test]
@@ -42,6 +57,81 @@ fn help_and_version_aliases_are_available_without_fasta_inputs() {
         let output = run(&[argument]);
         assert_eq!(output, "exonerate-rs 0.1.0\n");
     }
+}
+
+#[test]
+fn explicit_verbose_header_and_footer_match_upstream_layout() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    let output = run(&[
+        "--verbose",
+        "1",
+        "--model",
+        "ungapped",
+        "--exhaustive",
+        "yes",
+        "--subopt",
+        "no",
+        "--score",
+        "0",
+        "--showalignment",
+        "no",
+        "--showvulgar",
+        "no",
+        "--forwardonly",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    let mut lines = output.lines();
+    let command = lines.next().expect("command-line header");
+    assert!(command.starts_with("Command line: ["));
+    assert!(command.contains("--verbose 1 --model ungapped"));
+    assert!(
+        lines
+            .next()
+            .is_some_and(|line| line.starts_with("Hostname: ["))
+    );
+    assert_eq!(lines.next(), Some("-- completed exonerate analysis"));
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn default_and_signed_verbose_levels_match_upstream_behavior() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    let common = [
+        "--model",
+        "ungapped",
+        "--exhaustive",
+        "yes",
+        "--subopt",
+        "no",
+        "--score",
+        "0",
+        "--showalignment",
+        "no",
+        "--showvulgar",
+        "no",
+        "--forwardonly",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ];
+    let output = run_with_defaults(&common);
+    let expected_hostname = Command::new("hostname")
+        .output()
+        .expect("hostname command")
+        .stdout;
+    let expected_hostname = String::from_utf8(expected_hostname)
+        .expect("hostname is UTF-8")
+        .trim()
+        .to_owned();
+    assert!(output.starts_with("Command line: ["));
+    assert!(output.contains(&format!("Hostname: [{expected_hostname}]\n")));
+    assert!(output.ends_with("-- completed exonerate analysis\n"));
+
+    let mut quiet = vec!["--verbose", "-1"];
+    quiet.extend(common);
+    assert_eq!(run_with_defaults(&quiet), "");
 }
 
 #[test]
@@ -1982,6 +2072,39 @@ fn exhaustive_ner_reports_match_the_upstream_oracle() {
 }
 
 #[test]
+fn ner_zero_dpmemory_matches_full_generic_output() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    let common = [
+        "--model",
+        "ner",
+        "--exhaustive",
+        "yes",
+        "--subopt",
+        "no",
+        "--showalignment",
+        "no",
+        "--showsugar",
+        "yes",
+        "--showcigar",
+        "yes",
+        "--showvulgar",
+        "yes",
+        "--forwardonly",
+    ];
+    let mut full = common.to_vec();
+    full.extend([query.to_str().unwrap(), target.to_str().unwrap()]);
+    let mut checkpointed = common.to_vec();
+    checkpointed.extend([
+        "--dpmemory",
+        "0",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(run(&checkpointed), run(&full));
+}
+
+#[test]
 fn exhaustive_ungapped_trans_reports_match_the_upstream_oracle() {
     let query = fixture("coding-query.fa");
     let target = fixture("coding-genome.fa");
@@ -2010,6 +2133,34 @@ fn exhaustive_ungapped_trans_reports_match_the_upstream_oracle() {
             "vulgar: coding 30 117 + genome 64 151 + 155 C 87 87\n",
         )
     );
+}
+
+#[test]
+fn ungapped_translated_zero_dpmemory_uses_linear_generic_backend() {
+    let query = fixture("coding-query.fa");
+    let target = fixture("coding-genome.fa");
+    let output = run(&[
+        "--model",
+        "ungapped:trans",
+        "--exhaustive",
+        "yes",
+        "--subopt",
+        "no",
+        "--dpmemory",
+        "0",
+        "--showalignment",
+        "no",
+        "--showsugar",
+        "yes",
+        "--showcigar",
+        "yes",
+        "--showvulgar",
+        "yes",
+        "--forwardonly",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(output.contains("sugar: coding 30 117 + genome 64 151 + 155"));
 }
 
 #[test]
@@ -2212,6 +2363,89 @@ fn exhaustive_affine_scopes_match_the_upstream_oracle() {
 }
 
 #[test]
+fn affine_global_and_bestfit_subopt_match_the_upstream_oracle() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    for (model, expected) in [
+        ("affine:global", "sugar: q 0 8 + t 0 12 + 8\n"),
+        (
+            "affine:bestfit",
+            concat!(
+                "sugar: q 0 8 + t 2 10 + 40\n",
+                "sugar: q 0 8 + t 0 6 + 5\n",
+                "sugar: q 0 8 + t 6 12 + 5\n",
+            ),
+        ),
+    ] {
+        assert_eq!(
+            run(&[
+                "--model",
+                model,
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "yes",
+                "--score",
+                "0",
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "yes",
+                "--showcigar",
+                "no",
+                "--showvulgar",
+                "no",
+                "--revcomp",
+                "no",
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]),
+            expected,
+            "unexpected {model} suboptimal output",
+        );
+    }
+}
+
+#[test]
+fn affine_global_and_bestfit_bestn_match_the_upstream_oracle() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    for (model, expected) in [
+        ("affine:global", "sugar: q 0 8 + t 0 12 + 8\n"),
+        ("affine:bestfit", "sugar: q 0 8 + t 2 10 + 40\n"),
+    ] {
+        assert_eq!(
+            run(&[
+                "--model",
+                model,
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "yes",
+                "--bestn",
+                "1",
+                "--score",
+                "0",
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "yes",
+                "--showcigar",
+                "no",
+                "--showvulgar",
+                "no",
+                "--revcomp",
+                "no",
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]),
+            expected,
+            "unexpected {model} bestn output",
+        );
+    }
+}
+
+#[test]
 fn protein_affine_reports_match_the_upstream_oracle() {
     let query = fixture("protein-query.fa");
     let target = fixture("protein-target.fa");
@@ -2291,6 +2525,55 @@ fn exhaustive_protein_affine_subopt_matches_the_upstream_oracle() {
         ]),
         "vulgar: protein 0 29 . protein-target 2 31 . 146 M 29 29\n"
     );
+}
+
+#[test]
+fn protein_affine_nonlocal_scopes_subopt_match_the_upstream_oracle() {
+    let query = fixture("protein-query.fa");
+    let target = fixture("protein-target.fa");
+    for (model, expected) in [
+        (
+            "affine:global",
+            "sugar: protein 0 29 . protein-target 0 33 . 114\n",
+        ),
+        (
+            "affine:bestfit",
+            "sugar: protein 0 29 . protein-target 2 31 . 146\n",
+        ),
+        (
+            "affine:overlap",
+            "sugar: protein 0 29 . protein-target 2 31 . 146\n",
+        ),
+    ] {
+        assert_eq!(
+            run(&[
+                "--model",
+                model,
+                "--querytype",
+                "protein",
+                "--targettype",
+                "protein",
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "yes",
+                "--score",
+                "20",
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "yes",
+                "--showcigar",
+                "no",
+                "--showvulgar",
+                "no",
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]),
+            expected,
+            "unexpected {model} protein suboptimal output",
+        );
+    }
 }
 
 #[test]
@@ -2393,6 +2676,77 @@ fn zero_dp_memory_preserves_est2genome_cli_reports() {
     let mut checkpointed = common.to_vec();
     checkpointed.splice(3..3, ["--dpmemory", "0"]);
     assert_eq!(run(&checkpointed), full);
+}
+
+#[test]
+fn zero_dp_memory_preserves_raw_transition_reports() {
+    for (model, query_name, target_name, extra) in [
+        (
+            "ner",
+            "checkpoint-zero-query.fa",
+            "checkpoint-zero-target.fa",
+            Vec::<&str>::new(),
+        ),
+        (
+            "genome2genome",
+            "checkpoint-splice-query.fa",
+            "checkpoint-splice-target.fa",
+            vec![
+                "--minintron",
+                "6",
+                "--maxintron",
+                "20",
+                "--intronpenalty",
+                "-1",
+                "--forcegtag",
+                "yes",
+            ],
+        ),
+    ] {
+        let query = fixture(query_name);
+        let target = fixture(target_name);
+        let mut common = vec![
+            "--model",
+            model,
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--forwardonly",
+            "--score",
+            "0",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "{%Pn|%Ps|%Pqa|%Pta\\n}",
+        ];
+        common.extend(extra);
+        let mut full = common.clone();
+        full.extend([
+            "--dpmemory",
+            "4096",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        let mut checkpointed = common;
+        checkpointed.extend([
+            "--dpmemory",
+            "0",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            run(&checkpointed),
+            run(&full),
+            "raw transition mismatch for {model}"
+        );
+    }
 }
 
 #[test]

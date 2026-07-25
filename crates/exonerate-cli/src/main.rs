@@ -4,34 +4,62 @@ use exonerate_core::{
     align_cdna_to_genome_database_with_dp_memory_stranded,
     align_coding_to_genome_database_heuristic, align_coding_to_genome_database_suboptimal,
     align_coding_to_genome_database_with_dp_memory, align_coding2coding_database,
-    align_coding2coding_database_suboptimal, align_database_heuristic, align_database_suboptimal,
-    align_database_with_dp_memory, align_est2genome_database_heuristic,
+    align_coding2coding_database_suboptimal, align_database_affine_suboptimal,
+    align_database_heuristic, align_database_with_dp_memory, align_est2genome_database_heuristic,
     align_est2genome_database_suboptimal, align_est2genome_database_with_dp_memory,
     align_genome_to_genome_database_heuristic_stranded,
     align_genome_to_genome_database_heuristic_stranded_with_rolling_scores,
     align_genome_to_genome_database_stranded, align_genome_to_genome_database_suboptimal_stranded,
-    align_ner_database, align_ner_database_suboptimal, align_protein_database_suboptimal,
-    align_protein_database_with_dp_memory, align_protein_to_dna_database,
-    align_protein_to_dna_database_suboptimal, align_protein_to_genome_bestfit_database_heuristic,
-    align_protein_to_genome_database_heuristic, align_protein_to_genome_database_suboptimal,
-    align_protein_to_genome_database_with_dp_memory, align_protein_ungapped_database_suboptimal,
-    align_ungapped_database_suboptimal, align_ungapped_translated_database,
-    align_ungapped_translated_database_suboptimal, dna_self_score, dna_substitution_score,
+    align_ner_database_suboptimal_with_dp_memory, align_ner_database_with_dp_memory,
+    align_protein_database_affine_suboptimal, align_protein_database_with_dp_memory,
+    align_protein_to_dna_database, align_protein_to_dna_database_suboptimal,
+    align_protein_to_genome_bestfit_database_heuristic, align_protein_to_genome_database_heuristic,
+    align_protein_to_genome_database_suboptimal, align_protein_to_genome_database_with_dp_memory,
+    align_protein_ungapped_database_suboptimal, align_ungapped_database_suboptimal,
+    align_ungapped_translated_database_suboptimal_with_dp_memory,
+    align_ungapped_translated_database_with_dp_memory, dna_self_score, dna_substitution_score,
     protein_self_score, protein_substitution_score, read_fasta, reverse_complement, translate_dna,
     translated_self_score,
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 fn usage() -> &'static str {
-    "Usage: exonerate-rs [--shorthelp|--help] [--version] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
+    "Usage: exonerate-rs [--shorthelp|--help] [--version] [-V N|--verbose N] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
 }
 
 fn version() -> String {
     format!("exonerate-rs {}", env!("CARGO_PKG_VERSION"))
 }
+
+fn system_hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .and_then(|hostname| {
+            let hostname = hostname.trim();
+            (!hostname.is_empty()).then(|| hostname.to_owned())
+        })
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|hostname| {
+                    let hostname = hostname.trim();
+                    (!hostname.is_empty()).then(|| hostname.to_owned())
+                })
+        })
+        .or_else(|| {
+            std::env::var("HOSTNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 fn yes_no(value: &str) -> Result<bool, String> {
     match value {
         "yes" | "y" | "true" => Ok(true),
@@ -1067,7 +1095,9 @@ fn main() -> ExitCode {
     }
 }
 fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1).peekable();
+    let command_args: Vec<_> = std::env::args().collect();
+    let command_line = command_args.join(" ");
+    let mut args = command_args.into_iter().skip(1).peekable();
     let mut model = Model::Ungapped;
     let mut model_name = "ungapped".to_owned();
     let mut model_selected = false;
@@ -1102,6 +1132,7 @@ fn run() -> Result<(), String> {
     let mut subopt = true;
     let mut exhaustive = false;
     let mut dp_memory_mb = 32_usize;
+    let mut verbosity = 1_i32;
     let mut heuristic = HeuristicConfig::default();
     let mut files = Vec::new();
     while let Some(arg) = args.next() {
@@ -1333,6 +1364,13 @@ fn run() -> Result<(), String> {
                     .parse()
                     .map_err(|_| "invalid DP memory limit")?
             }
+            "-V" | "--verbose" => {
+                verbosity = args
+                    .next()
+                    .ok_or("missing verbosity level")?
+                    .parse()
+                    .map_err(|_| "invalid verbosity level")?
+            }
             "--score" => {
                 min_score = Some(
                     args.next()
@@ -1476,6 +1514,11 @@ fn run() -> Result<(), String> {
             "model {model_name} requires a protein query and DNA target"
         ));
     }
+    if verbosity > 0 {
+        let hostname = system_hostname();
+        write_stdout(&format!("Command line: [{command_line}]"), true)?;
+        write_stdout(&format!("Hostname: [{hostname}]"), true)?;
+    }
     let query_definitions = if ryo.is_some() {
         read_fasta_definitions(&files[0])?
     } else {
@@ -1499,12 +1542,8 @@ fn run() -> Result<(), String> {
         || coding2genome
         || protein2genome
         || protein2genome_bestfit
-        || (query_type == "dna"
-            && target_type == "dna"
-            && matches!(model, Model::Ungapped | Model::Local))
-        || (query_type == "protein"
-            && target_type == "protein"
-            && matches!(model, Model::Ungapped | Model::Local))
+        || (query_type == "dna" && target_type == "dna")
+        || (query_type == "protein" && target_type == "protein")
         || (query_type == "protein"
             && target_type == "dna"
             && matches!(model, Model::Ungapped | Model::Local | Model::BestFit));
@@ -1520,7 +1559,10 @@ fn run() -> Result<(), String> {
             && !est2genome
             && query_type == "dna"
             && target_type == "dna"
-            && matches!(model, Model::Ungapped | Model::Local);
+            && matches!(
+                model,
+                Model::Ungapped | Model::Global | Model::BestFit | Model::Local | Model::Overlap
+            );
         let protein_dna = !ungapped_translated
             && !ner
             && !coding2coding
@@ -1544,17 +1586,22 @@ fn run() -> Result<(), String> {
             && !est2genome
             && query_type == "protein"
             && target_type == "protein"
-            && matches!(model, Model::Ungapped | Model::Local);
+            && matches!(
+                model,
+                Model::Ungapped | Model::Global | Model::BestFit | Model::Local | Model::Overlap
+            );
         if ungapped_translated {
-            align_ungapped_translated_database_suboptimal(
+            align_ungapped_translated_database_suboptimal_with_dp_memory(
                 &q,
                 &t,
                 scoring,
                 min_score.unwrap_or(100),
                 both,
+                dp_memory_mb,
             )
+            .map_err(|error| error.to_string())?
         } else if ner {
-            align_ner_database_suboptimal(
+            align_ner_database_suboptimal_with_dp_memory(
                 &q,
                 &t,
                 scoring,
@@ -1563,7 +1610,9 @@ fn run() -> Result<(), String> {
                 ner_open,
                 min_score.unwrap_or(100),
                 both,
+                dp_memory_mb,
             )
+            .map_err(|error| error.to_string())?
         } else if est2genome {
             align_est2genome_database_suboptimal(&q, &t, intron, min_score.unwrap_or(100), both)
         } else if coding2coding {
@@ -1622,21 +1671,45 @@ fn run() -> Result<(), String> {
                     min_score.unwrap_or(100),
                 )
             } else {
-                align_protein_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
+                align_protein_database_affine_suboptimal(
+                    &q,
+                    &t,
+                    model,
+                    scoring,
+                    min_score.unwrap_or(100),
+                )
             }
         } else if plain_dna {
             if model == Model::Ungapped {
                 align_ungapped_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
             } else {
-                align_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100), both)
+                align_database_affine_suboptimal(
+                    &q,
+                    &t,
+                    model,
+                    scoring,
+                    min_score.unwrap_or(100),
+                    both,
+                )
             }
         } else {
             return Err("suboptimal enumeration is not implemented for this model".into());
         }
     } else if ungapped_translated {
-        align_ungapped_translated_database(&q, &t, scoring, both)
+        align_ungapped_translated_database_with_dp_memory(&q, &t, scoring, both, dp_memory_mb)
+            .map_err(|error| error.to_string())?
     } else if ner {
-        align_ner_database(&q, &t, scoring, min_ner, max_ner, ner_open, both)
+        align_ner_database_with_dp_memory(
+            &q,
+            &t,
+            scoring,
+            min_ner,
+            max_ner,
+            ner_open,
+            both,
+            dp_memory_mb,
+        )
+        .map_err(|error| error.to_string())?
     } else if coding2coding {
         align_coding2coding_database(&q, &t, scoring)
     } else if genome2genome {
@@ -1902,6 +1975,9 @@ fn run() -> Result<(), String> {
             )?;
             write_stdout(&rendered, false)?;
         }
+    }
+    if verbosity > 0 {
+        write_stdout("-- completed exonerate analysis", true)?;
     }
     Ok(())
 }
