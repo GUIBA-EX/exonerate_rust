@@ -21,7 +21,7 @@ use exonerate_core::{
     protein_self_score, protein_substitution_score, read_fasta, reverse_complement, translate_dna,
     translated_self_score,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, ExitCode};
@@ -30,7 +30,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 fn usage() -> &'static str {
-    "Usage: exonerate-rs [--shorthelp|--help] [--version] [-V N|--verbose N] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--query-id ID] [--target-id ID] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [--result-tsv FILE] [--evidence-gff3 FILE] [--audit protein-candidate] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nBatch: exonerate-rs --tasks TASKS.tsv --result-tsv FILE [--evidence-gff3 FILE] [--threads N] [COMMON OPTIONS]\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
+    "Usage: exonerate-rs [--shorthelp|--help] [--version] [-V N|--verbose N] [--model MODEL] [--querytype dna|protein] [--targettype dna|protein] [--query-id ID] [--target-id ID] [--querychunkid N --querychunktotal N] [--targetchunkid N --targetchunktotal N] [--gapopen N] [--gapextend N] [--codongapopen N] [--codongapextend N] [--frameshift N] [--minintron N] [--maxintron N] [--intronpenalty N] [--forcegtag yes|no] [--minner N] [--maxner N] [--neropen N] [--wordlen N] [--seedpadding N] [--seedrepeat N] [-D N|--dpmemory N] [--score N] [--percent N] [--bestn N] [--ryo FORMAT] [--result-tsv FILE] [--evidence-gff3 FILE] [--audit protein-candidate] [-q QUERY.fa] [-t TARGET.fa] [--subopt yes|no] [--exhaustive [yes|no]] [--revcomp yes|no] [--forwardcoordinates yes|no] [--forwardonly] [--showsugar yes|no] [--showcigar yes|no] [--showvulgar yes|no] [--showgff yes|no] [--showquerygff yes|no] [--showtargetgff yes|no] QUERY.fa TARGET.fa\n\nBatch: exonerate-rs --tasks TASKS.tsv --result-tsv FILE [--evidence-gff3 FILE] [--threads N] [COMMON OPTIONS]\nOrthology: add --orthology-report FILE --orthology-min-coverage F --orthology-min-delta N to an extended protein-candidate task manifest.\n\nImplemented models: ungapped, ungapped:trans, affine:global, affine:bestfit, affine:local, affine:overlap, coding2coding, coding2genome, cdna2genome, protein2dna, protein2dna:bestfit, protein2genome, protein2genome:bestfit, est2genome, genome2genome, ner"
 }
 
 fn version() -> String {
@@ -1316,12 +1316,23 @@ struct Task {
     query_id: String,
     target_fasta: String,
     target_id: String,
+    orthology: Option<OrthologyMetadata>,
+}
+
+#[derive(Clone)]
+struct OrthologyMetadata {
+    sample_id: String,
+    locus_id: String,
+    candidate_id: String,
+    expected_family: String,
+    reference_family: String,
 }
 
 fn read_tasks(path: &str) -> Result<Vec<Task>, String> {
     let file = File::open(path).map_err(|error| format!("open task manifest {path:?}: {error}"))?;
     let mut tasks = Vec::new();
     let mut header_seen = false;
+    let mut expected_orthology = false;
     for (line_number, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|error| format!("read task manifest {path:?}: {error}"))?;
         if line.trim().is_empty() || line.starts_with('#') {
@@ -1329,37 +1340,78 @@ fn read_tasks(path: &str) -> Result<Vec<Task>, String> {
         }
         let fields = line.split('\t').collect::<Vec<_>>();
         if !header_seen {
-            if fields.as_slice()
-                != [
-                    "task_id",
-                    "model",
-                    "query_fasta",
-                    "query_id",
-                    "target_fasta",
-                    "target_id",
-                ]
-            {
+            let basic_header = [
+                "task_id",
+                "model",
+                "query_fasta",
+                "query_id",
+                "target_fasta",
+                "target_id",
+            ];
+            let orthology_header = [
+                "task_id",
+                "sample_id",
+                "locus_id",
+                "candidate_id",
+                "expected_family",
+                "reference_family",
+                "model",
+                "query_fasta",
+                "query_id",
+                "target_fasta",
+                "target_id",
+            ];
+            if fields.as_slice() != basic_header && fields.as_slice() != orthology_header {
                 return Err(format!(
-                    "task manifest {path:?} line {} must use header: task_id\\tmodel\\tquery_fasta\\tquery_id\\ttarget_fasta\\ttarget_id",
+                    "task manifest {path:?} line {} must use the basic or orthology task header",
                     line_number + 1
                 ));
             }
+            expected_orthology = fields.as_slice() == orthology_header;
             header_seen = true;
             continue;
         }
-        if fields.len() != 6 || fields.iter().any(|field| field.is_empty()) {
+        let expected_fields = if expected_orthology { 11 } else { 6 };
+        if fields.len() != expected_fields || fields.iter().any(|field| field.is_empty()) {
             return Err(format!(
-                "task manifest {path:?} line {} must contain six non-empty tab-separated fields",
+                "task manifest {path:?} line {} must contain non-empty fields matching its header",
                 line_number + 1
             ));
         }
+        let (model, query_fasta, query_id, target_fasta, target_id, metadata) =
+            if expected_orthology {
+                (
+                    fields[6].to_owned(),
+                    fields[7].to_owned(),
+                    fields[8].to_owned(),
+                    fields[9].to_owned(),
+                    fields[10].to_owned(),
+                    Some(OrthologyMetadata {
+                        sample_id: fields[1].to_owned(),
+                        locus_id: fields[2].to_owned(),
+                        candidate_id: fields[3].to_owned(),
+                        expected_family: fields[4].to_owned(),
+                        reference_family: fields[5].to_owned(),
+                    }),
+                )
+            } else {
+                (
+                    fields[1].to_owned(),
+                    fields[2].to_owned(),
+                    fields[3].to_owned(),
+                    fields[4].to_owned(),
+                    fields[5].to_owned(),
+                    None,
+                )
+            };
         tasks.push(Task {
             id: fields[0].to_owned(),
-            model: fields[1].to_owned(),
-            query_fasta: fields[2].to_owned(),
-            query_id: fields[3].to_owned(),
-            target_fasta: fields[4].to_owned(),
-            target_id: fields[5].to_owned(),
+            model,
+            query_fasta,
+            query_id,
+            target_fasta,
+            target_id,
+            orthology: metadata,
         });
     }
     if !header_seen {
@@ -1377,10 +1429,222 @@ struct BatchResult {
     gff3: String,
 }
 
+#[derive(Clone)]
+struct AlignmentEvidence {
+    score: i32,
+    coverage: f64,
+    frameshift_bases: u64,
+    intron_count: u64,
+}
+
+struct OrthologyObservation {
+    sample_id: String,
+    locus_id: String,
+    candidate_id: String,
+    expected_family: String,
+    reference_family: String,
+    task_id: String,
+    evidence: Option<AlignmentEvidence>,
+    failed: bool,
+}
+
+fn best_alignment_evidence(rows: &[String]) -> (Option<AlignmentEvidence>, bool) {
+    let mut best = None;
+    let mut failed = false;
+    for row in rows {
+        let fields = row.split('\t').collect::<Vec<_>>();
+        match fields.get(1).copied() {
+            Some("aligned") => {
+                let evidence = match (
+                    fields.get(12).and_then(|value| value.parse().ok()),
+                    fields.get(18).and_then(|value| value.parse().ok()),
+                    fields.get(21).and_then(|value| value.parse().ok()),
+                    fields.get(22).and_then(|value| value.parse().ok()),
+                ) {
+                    (Some(score), Some(coverage), Some(frameshift_bases), Some(intron_count)) => {
+                        AlignmentEvidence {
+                            score,
+                            coverage,
+                            frameshift_bases,
+                            intron_count,
+                        }
+                    }
+                    _ => {
+                        failed = true;
+                        continue;
+                    }
+                };
+                if best
+                    .as_ref()
+                    .is_none_or(|current: &AlignmentEvidence| evidence.score > current.score)
+                {
+                    best = Some(evidence);
+                }
+            }
+            Some("failed") => failed = true,
+            _ => {}
+        }
+    }
+    (best, failed)
+}
+
+fn write_orthology_report(
+    path: &str,
+    tasks: &[Task],
+    results: &[BatchResult],
+    min_coverage: f64,
+    min_delta: i32,
+) -> Result<(), String> {
+    let mut groups = BTreeMap::<(String, String, String, String), Vec<OrthologyObservation>>::new();
+    for result in results {
+        let task = &tasks[result.index];
+        let metadata = task
+            .orthology
+            .as_ref()
+            .ok_or("orthology report requires an extended task manifest")?;
+        let (evidence, failed) = best_alignment_evidence(&result.rows);
+        groups
+            .entry((
+                metadata.sample_id.clone(),
+                metadata.locus_id.clone(),
+                metadata.candidate_id.clone(),
+                metadata.expected_family.clone(),
+            ))
+            .or_default()
+            .push(OrthologyObservation {
+                sample_id: metadata.sample_id.clone(),
+                locus_id: metadata.locus_id.clone(),
+                candidate_id: metadata.candidate_id.clone(),
+                expected_family: metadata.expected_family.clone(),
+                reference_family: metadata.reference_family.clone(),
+                task_id: task.id.clone(),
+                evidence,
+                failed,
+            });
+    }
+    let file =
+        File::create(path).map_err(|error| format!("create orthology report {path:?}: {error}"))?;
+    let mut output = io::BufWriter::new(file);
+    writeln!(output, "sample_id\tlocus_id\tcandidate_id\texpected_family\tstatus\texpected_score\texpected_coverage\tbest_competitor_family\tbest_competitor_score\tscore_delta\tframeshift_bases\tintron_count\texpected_task_id")
+        .map_err(|error| error.to_string())?;
+    for (_, observations) in groups {
+        let first = &observations[0];
+        let mut by_family = BTreeMap::<String, &OrthologyObservation>::new();
+        for observation in &observations {
+            if observation.evidence.is_none() {
+                continue;
+            }
+            let replace = by_family
+                .get(&observation.reference_family)
+                .and_then(|current| current.evidence.as_ref())
+                .is_none_or(|current| {
+                    observation
+                        .evidence
+                        .as_ref()
+                        .is_some_and(|next| next.score > current.score)
+                });
+            if replace {
+                by_family.insert(observation.reference_family.clone(), observation);
+            }
+        }
+        let expected = by_family.get(&first.expected_family).copied();
+        let expected_task_id = observations
+            .iter()
+            .find(|observation| observation.reference_family == first.expected_family)
+            .map_or("", |observation| observation.task_id.as_str());
+        let competitor = by_family
+            .iter()
+            .filter(|(family, _)| *family != &first.expected_family)
+            .filter_map(|(family, observation)| {
+                observation
+                    .evidence
+                    .as_ref()
+                    .map(|evidence| (family.as_str(), *observation, evidence))
+            })
+            .max_by_key(|(_, _, evidence)| evidence.score);
+        let (
+            status,
+            expected_score,
+            expected_coverage,
+            competitor_family,
+            competitor_score,
+            delta,
+            frameshift,
+            introns,
+        ) = if observations.iter().any(|observation| observation.failed) {
+            ("failed", None, None, None, None, None, None, None)
+        } else if let Some(expected) = expected {
+            let evidence = expected.evidence.as_ref().expect("aligned evidence");
+            let (competitor_family, competitor_score, delta) =
+                competitor.map_or((None, None, None), |(family, _, competitor)| {
+                    (
+                        Some(family),
+                        Some(competitor.score),
+                        Some(evidence.score - competitor.score),
+                    )
+                });
+            let status = if competitor_score.is_some_and(|score| score >= evidence.score) {
+                "unexpected_family"
+            } else if evidence.coverage < min_coverage {
+                "fragment"
+            } else if delta.is_some_and(|value| value < min_delta) {
+                "ambiguous"
+            } else {
+                "accepted"
+            };
+            (
+                status,
+                Some(evidence.score),
+                Some(evidence.coverage),
+                competitor_family,
+                competitor_score,
+                delta,
+                Some(evidence.frameshift_bases),
+                Some(evidence.intron_count),
+            )
+        } else if let Some((family, _, evidence)) = competitor {
+            (
+                "unexpected_family",
+                None,
+                None,
+                Some(family),
+                Some(evidence.score),
+                None,
+                None,
+                None,
+            )
+        } else {
+            ("no_hit", None, None, None, None, None, None, None)
+        };
+        writeln!(
+            output,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            tsv_field(&first.sample_id),
+            tsv_field(&first.locus_id),
+            tsv_field(&first.candidate_id),
+            tsv_field(&first.expected_family),
+            status,
+            expected_score.map_or(String::new(), |value| value.to_string()),
+            expected_coverage.map_or(String::new(), |value| format!("{value:.6}")),
+            competitor_family.map_or(String::new(), tsv_field),
+            competitor_score.map_or(String::new(), |value| value.to_string()),
+            delta.map_or(String::new(), |value| value.to_string()),
+            frameshift.map_or(String::new(), |value| value.to_string()),
+            introns.map_or(String::new(), |value| value.to_string()),
+            tsv_field(expected_task_id),
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn run_task_batch(command_args: &[String]) -> Result<(), String> {
     let mut task_path = None;
     let mut result_path = None;
     let mut evidence_path = None;
+    let mut orthology_path = None;
+    let mut orthology_min_coverage = 0.8_f64;
+    let mut orthology_min_delta = 20_i32;
     let mut threads = 1_usize;
     let mut common_args = Vec::new();
     let mut index = 1;
@@ -1413,6 +1677,39 @@ fn run_task_batch(command_args: &[String]) -> Result<(), String> {
                         .clone(),
                 );
             }
+            "--orthology-report" => {
+                index += 1;
+                orthology_path = Some(
+                    command_args
+                        .get(index)
+                        .ok_or("missing orthology report path")?
+                        .clone(),
+                );
+            }
+            "--orthology-min-coverage" => {
+                index += 1;
+                orthology_min_coverage = command_args
+                    .get(index)
+                    .ok_or("missing orthology minimum coverage")?
+                    .parse()
+                    .map_err(|_| "invalid orthology minimum coverage")?;
+                if !orthology_min_coverage.is_finite()
+                    || !(0.0..=1.0).contains(&orthology_min_coverage)
+                {
+                    return Err("orthology minimum coverage must be between 0 and 1".into());
+                }
+            }
+            "--orthology-min-delta" => {
+                index += 1;
+                orthology_min_delta = command_args
+                    .get(index)
+                    .ok_or("missing orthology minimum score delta")?
+                    .parse()
+                    .map_err(|_| "invalid orthology minimum score delta")?;
+                if orthology_min_delta < 0 {
+                    return Err("orthology minimum score delta must be non-negative".into());
+                }
+            }
             "--threads" => {
                 index += 1;
                 threads = command_args
@@ -1438,6 +1735,16 @@ fn run_task_batch(command_args: &[String]) -> Result<(), String> {
     let task_path = task_path.ok_or("--tasks requires a manifest path")?;
     let result_path = result_path.ok_or("--tasks requires --result-tsv FILE")?;
     let tasks = Arc::new(read_tasks(&task_path)?);
+    if orthology_path.is_some()
+        && !common_args
+            .windows(2)
+            .any(|arguments| arguments == ["--audit", "protein-candidate"])
+    {
+        return Err("--orthology-report requires --audit protein-candidate".into());
+    }
+    if orthology_path.is_some() && tasks.iter().any(|task| task.orthology.is_none()) {
+        return Err("--orthology-report requires the extended orthology task header".into());
+    }
     let temporary = std::env::temp_dir().join(format!(
         "exonerate-rs-tasks-{}-{}",
         std::process::id(),
@@ -1562,6 +1869,15 @@ fn run_task_batch(command_args: &[String]) -> Result<(), String> {
         for row in &result.rows {
             writeln!(output, "{row}\t").map_err(|error| error.to_string())?;
         }
+    }
+    if let Some(path) = orthology_path {
+        write_orthology_report(
+            &path,
+            &tasks,
+            &results,
+            orthology_min_coverage,
+            orthology_min_delta,
+        )?;
     }
     if let Some(path) = evidence_path {
         let file = File::create(&path)

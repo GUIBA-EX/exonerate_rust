@@ -3026,5 +3026,53 @@ fn machine_readable_reports_cover_single_batch_and_audit_workflows() {
             .expect("read audit TSV")
             .contains("\taligned\tprotein2genome:local\t")
     );
+
+    let competitor = directory.join("competitor.fa");
+    fs::write(&competitor, ">Fam_014\nWWWWWWWWWWWWWWWWWWWWWWWWWWWWW\n")
+        .expect("write competing protein");
+    let orthology_manifest = directory.join("orthology-tasks.tsv");
+    fs::write(
+        &orthology_manifest,
+        format!(
+            "task_id\tsample_id\tlocus_id\tcandidate_id\texpected_family\treference_family\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\nexpected\tS1\tLocus_001\tgenome\tFam_001\tFam_001\tprotein2genome\t{}\tprotein\t{}\tgenome\ncompetitor\tS1\tLocus_001\tgenome\tFam_001\tFam_014\tprotein2genome\t{}\tFam_014\t{}\tgenome\n",
+            protein.display(),
+            genome.display(),
+            competitor.display(),
+            genome.display(),
+        ),
+    )
+    .expect("write orthology task manifest");
+    let orthology_tsv = directory.join("orthology.tsv");
+    assert_eq!(
+        run(&[
+            "--tasks",
+            orthology_manifest.to_str().unwrap(),
+            "--audit",
+            "protein-candidate",
+            "--result-tsv",
+            directory.join("orthology-alignments.tsv").to_str().unwrap(),
+            "--orthology-report",
+            orthology_tsv.to_str().unwrap(),
+            "--orthology-min-coverage",
+            "0.8",
+            "--orthology-min-delta",
+            "20",
+            "--forwardonly",
+        ]),
+        ""
+    );
+    let orthology_rows = fs::read_to_string(&orthology_tsv).expect("read orthology report");
+    let orthology_rows = orthology_rows.lines().collect::<Vec<_>>();
+    assert_eq!(
+        orthology_rows[0],
+        "sample_id\tlocus_id\tcandidate_id\texpected_family\tstatus\texpected_score\texpected_coverage\tbest_competitor_family\tbest_competitor_score\tscore_delta\tframeshift_bases\tintron_count\texpected_task_id"
+    );
+    let values = orthology_rows[1].split('\t').collect::<Vec<_>>();
+    assert_eq!(values.len(), 13);
+    assert_eq!(
+        values[0..5],
+        ["S1", "Locus_001", "genome", "Fam_001", "accepted"]
+    );
+    assert_eq!(values[12], "expected");
     fs::remove_dir_all(directory).expect("remove test directory");
 }
