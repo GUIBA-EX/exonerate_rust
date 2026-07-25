@@ -3,7 +3,7 @@
 [![CI](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml)
 
 <p align="center">
-  <img src="docs/images/ferris-flat.svg" alt="Ferris，Rust 社区吉祥物的修订版平面原图" width="480">
+  <img src="docs/images/exonerate-rs-overview.svg" alt="官方修订版 Ferris 与 exonerate-rs 的序列比对、剪接、GFF3 证据和 checkpoint traceback 功能图" width="760">
   <br>
   <sub>Ferris by Karen Rustad Tölva · <a href="https://rustacean.net/">rustacean.net</a> · CC0</sub>
 </p>
