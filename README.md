@@ -88,6 +88,28 @@ target/release/exonerate-rs \
 人读报告、执行完整搜索，并要求 `--result-tsv`。TSV 包含覆盖度、缺口、移码和
 内含子计数；GFF3 是比对证据（`match` / `match_part`），不是基因结构预测。
 
+### 参考面板正交性审计
+
+在蛋白候选审计中，可使用扩展任务清单让同一候选与多个 family 竞争：
+
+```text
+task_id	sample_id	locus_id	candidate_id	expected_family	reference_family	model	query_fasta	query_id	target_fasta	target_id
+S1.L1.expected	S1	Locus_001	contig_42	Fam_001	Fam_001	protein2genome	proteins.fa	Fam_001	candidates.fa	contig_42
+S1.L1.other	S1	Locus_001	contig_42	Fam_001	Fam_014	protein2genome	proteins.fa	Fam_014	candidates.fa	contig_42
+```
+
+```bash
+target/release/exonerate-rs \
+  --tasks orthology_tasks.tsv --audit protein-candidate --threads 4 \
+  --result-tsv alignments.tsv --orthology-report orthology.tsv \
+  --orthology-min-coverage 0.80 --orthology-min-delta 20
+```
+
+`orthology.tsv` 每个候选一行，保留预期与最强竞争 family 的分数、差值、覆盖度、
+移码、内含子数和可回溯的 task ID。状态只描述给定面板中的证据：`accepted`、
+`ambiguous`、`fragment`、`unexpected_family`、`no_hit` 或 `failed`；不用于声明
+真实拷贝数或取代 gene tree。
+
 完整的模型和参数兼容证据见[兼容范围](COMPATIBILITY.md)与
 [命令行基准覆盖](ORACLE_MATRIX.md)。
 
