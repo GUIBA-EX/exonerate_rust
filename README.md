@@ -3,7 +3,9 @@
 [![CI](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml)
 
 <p align="center">
-  <img src="docs/images/exonerate-rs-overview.png" alt="exonerate-rs：Rust 螃蟹与序列比对、剪接证据、checkpoint 和批量任务示意图" width="480">
+  <img src="docs/images/ferris-flat.svg" alt="Ferris，Rust 社区吉祥物的修订版平面原图" width="480">
+  <br>
+  <sub>Ferris by Karen Rustad Tölva · <a href="https://rustacean.net/">rustacean.net</a> · CC0</sub>
 </p>
 
 Exonerate 2.4.0 的 Rust 重实现。项目以得分、traceback、坐标和主要 CLI
