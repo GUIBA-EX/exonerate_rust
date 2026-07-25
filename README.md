@@ -2,6 +2,10 @@
 
 [![CI](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml/badge.svg)](https://github.com/GUIBA-EX/exonerate_rust/actions/workflows/ci.yml)
 
+<p align="center">
+  <img src="docs/images/exonerate-rs-overview.png" alt="exonerate-rs：Rust 螃蟹与序列比对、剪接证据、checkpoint 和批量任务示意图" width="480">
+</p>
+
 Exonerate 2.4.0 的 Rust 重实现。项目以得分、traceback、坐标和主要 CLI
 输出兼容为目标，同时提供精确的低内存执行路径。
 
