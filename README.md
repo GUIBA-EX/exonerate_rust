@@ -94,6 +94,5 @@ scripts/validate_peak_rss.sh
 - [架构](exonerate.md)：工作区、数据流和设计不变量
 - [通用 C4 checkpoint 设计](C4_CHECKPOINT_DESIGN.md)：低内存回放设计
 - [DP 内存验证](MEMORY_VALIDATION.md)：预算语义与 RSS 验证
-- [开发状态](DEVELOPMENT_STATUS.md)：当前能力和范围边界
 
 许可证：[GPL-3.0-only](LICENSE)。

@@ -17,9 +17,6 @@ crates/
 └── exonerate-cli/   # 参数、FASTA、排序和输出
 ```
 
-当前保持两个 crate。只有出现清晰、稳定的依赖边界时才拆分，避免为架构
-图增加无收益的层级。
-
 ## 核心数据流
 
 ```text
@@ -91,12 +88,5 @@ Waterman–Eggert 枚举通过禁止已使用的 equivalenced pairs 生成下一
 2. 命令行：固定 fixture 与 upstream 的字节级基准；
 3. 资源：full/checkpoint 等价、时间和 peak RSS。
 
-CI 固定 Rust 1.87.0，执行 rustfmt、严格 clippy、全部测试、doctest 和
-rustdoc。大型性能 fixture 不进入普通 CI。
-
-## 演进原则
-
-1. 先完成模型功能，再扩大基准覆盖。
-2. 先保证正确，再优化内存与速度。
-3. 优先复用同一执行器，不复制模型算法。
-4. 新抽象必须消除真实重复，否则不引入。
+CI 执行 rustfmt、严格 clippy、测试、doctest 和 rustdoc；大型性能 fixture
+不进入普通 CI。
