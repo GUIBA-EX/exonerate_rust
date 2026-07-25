@@ -66,6 +66,28 @@ target/release/exonerate-rs \
 - 内部坐标为零基半开区间；默认输出正向参考坐标。
 - GFF2 不在项目范围内。
 
+## 批量候选审计
+
+`--tasks` 将多个显式任务并发执行；每行固定选择一个 FASTA 记录，适合把
+上游候选序列的选择和比对证据分开保存。结果仍按清单顺序写出，不随线程数改变。
+
+```text
+task_id	model	query_fasta	query_id	target_fasta	target_id
+gene_001	protein2genome	proteins.fa	gene_001	candidates.fa	contig_42
+```
+
+```bash
+target/release/exonerate-rs \
+  --tasks tasks.tsv --threads 4 \
+  --audit protein-candidate \
+  --result-tsv evidence.tsv \
+  --evidence-gff3 evidence.gff3
+```
+
+`--audit protein-candidate` 是 `protein2dna` / `protein2genome` 的薄预设：关闭
+人读报告、执行完整搜索，并要求 `--result-tsv`。TSV 包含覆盖度、缺口、移码和
+内含子计数；GFF3 是比对证据（`match` / `match_part`），不是基因结构预测。
+
 完整的模型和参数兼容证据见[兼容范围](COMPATIBILITY.md)与
 [命令行基准覆盖](ORACLE_MATRIX.md)。
 

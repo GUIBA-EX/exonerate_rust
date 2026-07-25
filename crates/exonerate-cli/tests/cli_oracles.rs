@@ -1,5 +1,7 @@
+use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -45,6 +47,19 @@ fn run_with_defaults(args: &[&str]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout).expect("CLI output is UTF-8")
+}
+
+fn test_directory(name: &str) -> PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "exonerate-rs-{name}-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after Unix epoch")
+            .as_nanos()
+    ));
+    fs::create_dir(&directory).expect("create test directory");
+    directory
 }
 
 #[test]
@@ -2907,4 +2922,109 @@ fn short_minimum_intron_is_safe_for_phase_intron_models() {
         ]),
         "vulgar: coding 0 117 + genome 0 151 + 194 C 27 27 S 2 2 5 0 2 I 0 30 3 0 2 S 1 1 C 87 87\n"
     );
+}
+
+#[test]
+fn machine_readable_reports_cover_single_batch_and_audit_workflows() {
+    let directory = test_directory("machine-reports");
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    let single_tsv = directory.join("single.tsv");
+    let single_gff3 = directory.join("single.gff3");
+    let output = run(&[
+        "--model",
+        "affine:local",
+        "--exhaustive",
+        "yes",
+        "--subopt",
+        "no",
+        "--score",
+        "0",
+        "--forwardonly",
+        "--showalignment",
+        "no",
+        "--showvulgar",
+        "no",
+        "--result-tsv",
+        single_tsv.to_str().unwrap(),
+        "--evidence-gff3",
+        single_gff3.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert_eq!(output, "");
+    let single_rows = fs::read_to_string(&single_tsv).expect("read single TSV");
+    assert!(single_rows.starts_with("task_id\tstatus\tmodel\trank\t"));
+    assert!(single_rows.contains("\taligned\taffine:local:dna2dna\t"));
+    assert!(single_rows.contains("query_aligned"));
+    let single_evidence = fs::read_to_string(&single_gff3).expect("read single GFF3");
+    assert!(single_evidence.starts_with("##gff-version 3\n"));
+    assert!(single_evidence.contains("\tmatch\t"));
+    assert!(!single_evidence.contains("Task=;"));
+
+    let manifest = directory.join("tasks.tsv");
+    fs::write(
+        &manifest,
+        format!(
+            "task_id\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\nfirst\taffine:local\t{}\tq\t{}\tt\nsecond\taffine:local\t{}\tq\t{}\tt\n",
+            query.display(), target.display(), query.display(), target.display()
+        ),
+    )
+    .expect("write task manifest");
+    let batch_tsv = directory.join("batch.tsv");
+    let batch_gff3 = directory.join("batch.gff3");
+    assert_eq!(
+        run(&[
+            "--tasks",
+            manifest.to_str().unwrap(),
+            "--result-tsv",
+            batch_tsv.to_str().unwrap(),
+            "--evidence-gff3",
+            batch_gff3.to_str().unwrap(),
+            "--threads",
+            "2",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--score",
+            "0",
+            "--forwardonly",
+        ]),
+        ""
+    );
+    let batch_rows = fs::read_to_string(&batch_tsv).expect("read batch TSV");
+    let rows = batch_rows.lines().collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    assert!(rows[1].starts_with("first\taligned\t"));
+    assert!(rows[2].starts_with("second\taligned\t"));
+    let batch_evidence = fs::read_to_string(&batch_gff3).expect("read batch GFF3");
+    assert!(batch_evidence.contains("Task=first"));
+    assert!(batch_evidence.contains("Task=second"));
+    assert!(batch_evidence.contains("ID=alignment.first.t.1"));
+    assert!(batch_evidence.contains("ID=alignment.second.t.1"));
+
+    let protein = fixture("protein-query.fa");
+    let genome = fixture("protein-genome.fa");
+    let audit_tsv = directory.join("audit.tsv");
+    assert_eq!(
+        run(&[
+            "--model",
+            "protein2genome",
+            "--audit",
+            "protein-candidate",
+            "--result-tsv",
+            audit_tsv.to_str().unwrap(),
+            "--forwardonly",
+            protein.to_str().unwrap(),
+            genome.to_str().unwrap(),
+        ]),
+        ""
+    );
+    assert!(
+        fs::read_to_string(&audit_tsv)
+            .expect("read audit TSV")
+            .contains("\taligned\tprotein2genome:local\t")
+    );
+    fs::remove_dir_all(directory).expect("remove test directory");
 }
