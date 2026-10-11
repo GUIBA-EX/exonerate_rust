@@ -13,16 +13,250 @@ struct ScoreRow {
     d: Vec<Score>,
 }
 
+// Sequence-dependent scores are shared by the forward pass and all replay
+// blocks. Computing splice predictor logarithms in each DP cell dominated runtime.
+struct SpliceCache {
+    donors: Vec<Option<Score>>,
+    acceptors: Vec<Option<Score>>,
+    translated: Vec<u8>,
+}
+impl SpliceCache {
+    fn new(bases: &[u8], intron: IntronScoring) -> Self {
+        Self::est_direction(bases, intron, false)
+    }
+
+    fn est_direction(bases: &[u8], intron: IntronScoring, reverse: bool) -> Self {
+        let (opening, closing) = est_splice_types(reverse);
+        Self {
+            donors: (0..=bases.len())
+                .map(|j| splice_score(bases, j, opening, intron.force_gtag))
+                .collect(),
+            acceptors: (0..=bases.len())
+                .map(|j| splice_score(bases, j, closing, intron.force_gtag))
+                .collect(),
+            translated: bases.windows(3).map(translate_codon).collect(),
+        }
+    }
+}
+
+// Eight bytes per predecessor instead of storing expanded trace and raw
+// report fragments in every cell. Expand only the selected traceback.
+#[derive(Clone, Copy)]
+struct CompactEstParent {
+    state: State,
+    kind: u16,
+    length: u32,
+}
+impl CompactEstParent {
+    fn expand(
+        self,
+        query: &Sequence,
+        bases: &[u8],
+        i: usize,
+        j: usize,
+        intron: IntronScoring,
+        cache: &SpliceCache,
+    ) -> EstParent {
+        let prefix = match self.state {
+            State::I => Some(9),
+            State::D => Some(10),
+            _ => None,
+        };
+        if self.kind == 6 {
+            let start = j - self.length as usize;
+            let runs = [
+                TraceRun {
+                    transition_id: 6,
+                    op: Op::Splice5,
+                    query_advance: 0,
+                    target_advance: 2,
+                    repeats: 1,
+                },
+                TraceRun {
+                    transition_id: 7,
+                    op: Op::Intron,
+                    query_advance: 0,
+                    target_advance: self.length - 4,
+                    repeats: 1,
+                },
+                TraceRun {
+                    transition_id: 8,
+                    op: Op::Splice3,
+                    query_advance: 0,
+                    target_advance: 2,
+                    repeats: 1,
+                },
+            ];
+            let scores = [
+                intron
+                    .open_penalty
+                    .saturating_add(cache.donors[start].unwrap_or(0)),
+                0,
+                cache.acceptors[j - 2].unwrap_or(0),
+            ];
+            let steps = std::array::from_fn::<_, 3, _>(|k| RawStep {
+                transition_id: runs[k].transition_id,
+                query_advance: 0,
+                target_advance: runs[k].target_advance,
+                score: scores[k],
+            });
+            EstParent {
+                state: self.state,
+                fragment: TraceFragment::intron(runs[0], runs[1], runs[2]),
+                raw_fragment: RawFragment::with_prefix(prefix, &steps),
+            }
+        } else {
+            let (op, qa, ta, score) = match self.kind {
+                1 => (
+                    Op::Match,
+                    1,
+                    1,
+                    dna_score(query.bases[i - 1], bases[j - 1], Scoring::default()),
+                ),
+                2 | 4 => (Op::Insert, 1, 0, if self.kind == 2 { -12 } else { -4 }),
+                3 | 5 => (Op::Delete, 0, 1, if self.kind == 3 { -12 } else { -4 }),
+                _ => unreachable!("compact EST transition"),
+            };
+            let step = RawStep {
+                transition_id: self.kind,
+                query_advance: qa,
+                target_advance: ta,
+                score,
+            };
+            EstParent {
+                state: self.state,
+                fragment: TraceFragment::one(TraceRun {
+                    transition_id: self.kind,
+                    op,
+                    query_advance: qa,
+                    target_advance: ta,
+                    repeats: 1,
+                }),
+                raw_fragment: RawFragment::with_prefix(
+                    if self.kind == 1 { prefix } else { None },
+                    &[step],
+                ),
+            }
+        }
+    }
+}
+
 type EstParentSlices<'a> = (
-    &'a mut [Option<EstParent>],
-    &'a mut [Option<EstParent>],
-    &'a mut [Option<EstParent>],
+    &'a mut [Option<CompactEstParent>],
+    &'a mut [Option<CompactEstParent>],
+    &'a mut [Option<CompactEstParent>],
 );
 type EstParentRows = (
-    Vec<Option<EstParent>>,
-    Vec<Option<EstParent>>,
-    Vec<Option<EstParent>>,
+    Vec<Option<CompactEstParent>>,
+    Vec<Option<CompactEstParent>>,
+    Vec<Option<CompactEstParent>>,
 );
+#[derive(Clone, Copy)]
+struct CompactP2Parent {
+    state: State,
+    kind: u8,
+    phase: u8,
+    advance: u8,
+    length: u32,
+}
+type CompactP2ParentSlices<'a> = (
+    &'a mut [Option<CompactP2Parent>],
+    &'a mut [Option<CompactP2Parent>],
+    &'a mut [Option<CompactP2Parent>],
+);
+type CompactP2ParentRows = (
+    Vec<Option<CompactP2Parent>>,
+    Vec<Option<CompactP2Parent>>,
+    Vec<Option<CompactP2Parent>>,
+);
+impl CompactP2Parent {
+    fn expand(self) -> P2GenomeParent {
+        if self.kind == 20 {
+            let phase = self.phase as usize;
+            let post_len = 3 - phase;
+            let intron_len = self.length;
+            let splice5 = TraceRun {
+                transition_id: 20,
+                op: Op::Splice5,
+                query_advance: 0,
+                target_advance: 2,
+                repeats: 1,
+            };
+            let loop_run = TraceRun {
+                transition_id: 21,
+                op: Op::Intron,
+                query_advance: 0,
+                target_advance: intron_len - 4,
+                repeats: 1,
+            };
+            let splice3 = TraceRun {
+                transition_id: 22,
+                op: Op::Splice3,
+                query_advance: 0,
+                target_advance: 2,
+                repeats: 1,
+            };
+            let fragment = if phase == 0 {
+                TraceFragment::intron_match(
+                    splice5,
+                    loop_run,
+                    splice3,
+                    TraceRun {
+                        transition_id: 1,
+                        op: Op::Match,
+                        query_advance: 1,
+                        target_advance: 3,
+                        repeats: 1,
+                    },
+                )
+            } else {
+                TraceFragment::phase_intron(
+                    TraceRun {
+                        transition_id: 23,
+                        op: Op::SplitCodon,
+                        query_advance: 0,
+                        target_advance: phase as u32,
+                        repeats: 1,
+                    },
+                    splice5,
+                    loop_run,
+                    splice3,
+                    TraceRun {
+                        transition_id: 24,
+                        op: Op::SplitCodon,
+                        query_advance: 1,
+                        target_advance: post_len as u32,
+                        repeats: 1,
+                    },
+                )
+            };
+
+            P2GenomeParent {
+                state: self.state,
+                fragment,
+            }
+        } else {
+            let op = match self.kind {
+                1 => Op::Match,
+                2 | 4 => Op::Insert,
+                3 | 5 => Op::Delete,
+                6 => Op::Frameshift,
+                _ => unreachable!("compact protein transition"),
+            };
+            P2GenomeParent {
+                state: self.state,
+                fragment: TraceFragment::one(TraceRun {
+                    transition_id: u16::from(self.kind),
+                    op,
+                    query_advance: u32::from(matches!(self.kind, 1 | 2 | 4)),
+                    target_advance: u32::from(self.advance),
+                    repeats: 1,
+                }),
+            }
+        }
+    }
+}
+
 type P2ParentSlices<'a> = (
     &'a mut [Option<P2GenomeParent>],
     &'a mut [Option<P2GenomeParent>],
@@ -281,8 +515,8 @@ fn valid_end(model: Model, i: usize, j: usize, n: usize, m: usize) -> bool {
 }
 
 fn consider_end(end: &mut EndPoint, i: usize, j: usize, state: State, score: Score) {
-    if score > end.score
-        || (score == end.score && (i, j, state.rank()) > (end.i, end.j, end.state.rank()))
+    if endpoint_key(score, i, j, state.rank())
+        > endpoint_key(end.score, end.i, end.j, end.state.rank())
     {
         *end = EndPoint { i, j, state, score };
     }
@@ -398,6 +632,7 @@ fn fill_row(
 fn fill_est_row(
     query: &Sequence,
     bases: &[u8],
+    cache: &SpliceCache,
     row: usize,
     intron: IntronScoring,
     previous: Option<(&[Score], &[Score], &[Score])>,
@@ -414,7 +649,7 @@ fn fill_est_row(
         pi.fill(None);
         pd.fill(None);
     }
-    let mut window = IntronCandidateWindow::default();
+    let mut window = IntronCandidateWindow::for_target(intron.max_len, bases.len());
     for j in 0..=bases.len() {
         if j >= intron.min_len as usize {
             let start = j - intron.min_len as usize;
@@ -424,9 +659,7 @@ fn fill_est_row(
                 (current_d[start], State::D),
             ]);
             if source > 0 {
-                if let Some(donor) =
-                    splice_score(bases, start, SpliceType::DonorForward, intron.force_gtag)
-                {
+                if let Some(donor) = cache.donors[start] {
                     window.insert(IntronCandidate {
                         start,
                         score: add(source, intron.open_penalty.saturating_add(donor)),
@@ -439,75 +672,16 @@ fn fill_est_row(
             window.expire_before(j - intron.max_len as usize);
         }
         if j >= 2 {
-            if let (Some(candidate), Some(acceptor)) = (
-                window.best(),
-                splice_score(bases, j - 2, SpliceType::AcceptorForward, intron.force_gtag),
-            ) {
+            if let (Some(candidate), Some(acceptor)) = (window.best(), cache.acceptors[j - 2]) {
                 let score = add(candidate.score, acceptor);
                 if score > current_m[j] {
                     let length = (j - candidate.start) as u32;
                     current_m[j] = score;
                     if let Some((pm, _, _)) = parents.as_mut() {
-                        pm[j] = Some(EstParent {
+                        pm[j] = Some(CompactEstParent {
                             state: state_from_rank(candidate.state_rank),
-                            fragment: TraceFragment::intron(
-                                TraceRun {
-                                    transition_id: 6,
-                                    op: Op::Splice5,
-                                    query_advance: 0,
-                                    target_advance: 2,
-                                    repeats: 1,
-                                },
-                                TraceRun {
-                                    transition_id: 7,
-                                    op: Op::Intron,
-                                    query_advance: 0,
-                                    target_advance: length - 4,
-                                    repeats: 1,
-                                },
-                                TraceRun {
-                                    transition_id: 8,
-                                    op: Op::Splice3,
-                                    query_advance: 0,
-                                    target_advance: 2,
-                                    repeats: 1,
-                                },
-                            ),
-                            raw_fragment: RawFragment::with_prefix(
-                                match state_from_rank(candidate.state_rank) {
-                                    State::I => Some(9),
-                                    State::D => Some(10),
-                                    _ => None,
-                                },
-                                &[
-                                    RawStep {
-                                        transition_id: 6,
-                                        query_advance: 0,
-                                        target_advance: 2,
-                                        score: intron.open_penalty.saturating_add(
-                                            splice_score(
-                                                bases,
-                                                candidate.start,
-                                                SpliceType::DonorForward,
-                                                intron.force_gtag,
-                                            )
-                                            .unwrap_or(0),
-                                        ),
-                                    },
-                                    RawStep {
-                                        transition_id: 7,
-                                        query_advance: 0,
-                                        target_advance: length - 4,
-                                        score: 0,
-                                    },
-                                    RawStep {
-                                        transition_id: 8,
-                                        query_advance: 0,
-                                        target_advance: 2,
-                                        score: acceptor,
-                                    },
-                                ],
-                            ),
+                            kind: 6,
+                            length,
                         });
                     }
                 }
@@ -527,32 +701,10 @@ fn fill_est_row(
             if score > current_m[j] {
                 current_m[j] = score;
                 if let Some((pm, _, _)) = parents.as_mut() {
-                    pm[j] = Some(EstParent {
+                    pm[j] = Some(CompactEstParent {
                         state,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id: 1,
-                            op: Op::Match,
-                            query_advance: 1,
-                            target_advance: 1,
-                            repeats: 1,
-                        }),
-                        raw_fragment: RawFragment::with_prefix(
-                            match state {
-                                State::I => Some(9),
-                                State::D => Some(10),
-                                _ => None,
-                            },
-                            &[RawStep {
-                                transition_id: 1,
-                                query_advance: 1,
-                                target_advance: 1,
-                                score: dna_score(
-                                    query.bases[row - 1],
-                                    bases[j - 1],
-                                    Scoring::default(),
-                                ),
-                            }],
-                        ),
+                        kind: 1,
+                        length: 1,
                     });
                 }
             }
@@ -568,21 +720,10 @@ fn fill_est_row(
             if score >= 0 {
                 current_i[j] = score;
                 if let Some((_, pi, _)) = parents.as_mut() {
-                    pi[j] = Some(EstParent {
+                    pi[j] = Some(CompactEstParent {
                         state,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id,
-                            op: Op::Insert,
-                            query_advance: 1,
-                            target_advance: 0,
-                            repeats: 1,
-                        }),
-                        raw_fragment: RawFragment::one(RawStep {
-                            transition_id,
-                            query_advance: 1,
-                            target_advance: 0,
-                            score: if transition_id == 2 { -12 } else { -4 },
-                        }),
+                        kind: transition_id,
+                        length: 1,
                     });
                 }
             }
@@ -597,21 +738,10 @@ fn fill_est_row(
             if score >= 0 {
                 current_d[j] = score;
                 if let Some((_, _, pd)) = parents.as_mut() {
-                    pd[j] = Some(EstParent {
+                    pd[j] = Some(CompactEstParent {
                         state,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id,
-                            op: Op::Delete,
-                            query_advance: 0,
-                            target_advance: 1,
-                            repeats: 1,
-                        }),
-                        raw_fragment: RawFragment::one(RawStep {
-                            transition_id,
-                            query_advance: 0,
-                            target_advance: 1,
-                            score: if transition_id == 3 { -12 } else { -4 },
-                        }),
+                        kind: transition_id,
+                        length: 1,
                     });
                 }
             }
@@ -623,6 +753,7 @@ fn fill_est_row(
 fn fill_p2g_row(
     query: &Sequence,
     bases: &[u8],
+    cache: &SpliceCache,
     row: usize,
     scoring: Scoring,
     intron: IntronScoring,
@@ -631,7 +762,7 @@ fn fill_p2g_row(
     current_m: &mut [Score],
     current_i: &mut [Score],
     current_d: &mut [Score],
-    mut parents: Option<P2ParentSlices<'_>>,
+    mut parents: Option<CompactP2ParentSlices<'_>>,
 ) {
     current_m.fill(if bestfit { NEG_INF } else { 0 });
     current_i.fill(NEG_INF);
@@ -641,11 +772,12 @@ fn fill_p2g_row(
         pi.fill(None);
         pd.fill(None);
     }
+    let substitutions = protein_score_row(query.bases[row - 1]);
     let (previous_m, previous_i, previous_d) = previous;
     let mut phase_windows = [
-        IntronCandidateWindow::default(),
-        IntronCandidateWindow::default(),
-        IntronCandidateWindow::default(),
+        IntronCandidateWindow::for_target(intron.max_len, bases.len()),
+        IntronCandidateWindow::for_target(intron.max_len, bases.len()),
+        IntronCandidateWindow::for_target(intron.max_len, bases.len()),
     ];
     for j in 0..=bases.len() {
         for (phase, window) in phase_windows.iter_mut().enumerate() {
@@ -662,9 +794,7 @@ fn fill_p2g_row(
                 (previous_d[source_j], State::D),
             ]);
             if source > 0 || bestfit {
-                if let Some(donor_score) =
-                    splice_score(bases, donor, SpliceType::DonorForward, intron.force_gtag)
-                {
+                if let Some(donor_score) = cache.donors[donor] {
                     window.insert(IntronCandidate {
                         start: donor,
                         score: add(source, intron.open_penalty.saturating_add(donor_score)),
@@ -681,87 +811,32 @@ fn fill_p2g_row(
             if post_start < 2 {
                 continue;
             }
-            let Some(acceptor) = splice_score(
-                bases,
-                post_start - 2,
-                SpliceType::AcceptorForward,
-                intron.force_gtag,
-            ) else {
+            let Some(acceptor) = cache.acceptors[post_start - 2] else {
                 continue;
             };
-            let pre_start = candidate.start - phase;
-            let mut codon = Vec::with_capacity(3);
-            codon.extend_from_slice(&bases[pre_start..candidate.start]);
-            codon.extend_from_slice(&bases[post_start..j]);
-            if codon.len() != 3 {
-                continue;
-            }
+            let amino = if phase == 0 {
+                cache.translated[j - 3]
+            } else {
+                let pre_start = candidate.start - phase;
+                let mut codon = [0; 3];
+                codon[..phase].copy_from_slice(&bases[pre_start..candidate.start]);
+                codon[phase..].copy_from_slice(&bases[post_start..j]);
+                translate_codon(&codon)
+            };
             let score = add(
                 add(candidate.score, acceptor),
-                protein_score(query.bases[row - 1], translate_dna(&codon, 0)[0], scoring),
+                substitutions[amino as usize],
             );
             if score > current_m[j] {
                 let intron_len = (post_start - candidate.start) as u32;
-                let splice5 = TraceRun {
-                    transition_id: 20,
-                    op: Op::Splice5,
-                    query_advance: 0,
-                    target_advance: 2,
-                    repeats: 1,
-                };
-                let loop_run = TraceRun {
-                    transition_id: 21,
-                    op: Op::Intron,
-                    query_advance: 0,
-                    target_advance: intron_len - 4,
-                    repeats: 1,
-                };
-                let splice3 = TraceRun {
-                    transition_id: 22,
-                    op: Op::Splice3,
-                    query_advance: 0,
-                    target_advance: 2,
-                    repeats: 1,
-                };
-                let fragment = if phase == 0 {
-                    TraceFragment::intron_match(
-                        splice5,
-                        loop_run,
-                        splice3,
-                        TraceRun {
-                            transition_id: 1,
-                            op: Op::Match,
-                            query_advance: 1,
-                            target_advance: 3,
-                            repeats: 1,
-                        },
-                    )
-                } else {
-                    TraceFragment::phase_intron(
-                        TraceRun {
-                            transition_id: 23,
-                            op: Op::SplitCodon,
-                            query_advance: 0,
-                            target_advance: phase as u32,
-                            repeats: 1,
-                        },
-                        splice5,
-                        loop_run,
-                        splice3,
-                        TraceRun {
-                            transition_id: 24,
-                            op: Op::SplitCodon,
-                            query_advance: 1,
-                            target_advance: post_len as u32,
-                            repeats: 1,
-                        },
-                    )
-                };
                 current_m[j] = score;
                 if let Some((pm, _, _)) = parents.as_mut() {
-                    pm[j] = Some(P2GenomeParent {
+                    pm[j] = Some(CompactP2Parent {
                         state: state_from_rank(candidate.state_rank),
-                        fragment,
+                        kind: 20,
+                        phase: phase as u8,
+                        advance: 0,
+                        length: intron_len,
                     });
                 }
             }
@@ -772,29 +847,23 @@ fn fill_p2g_row(
             if from_m >= from_d && (from_m >= 0 || bestfit) {
                 current_d[j] = from_m;
                 if let Some((_, _, pd)) = parents.as_mut() {
-                    pd[j] = Some(P2GenomeParent {
+                    pd[j] = Some(CompactP2Parent {
                         state: State::M,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id: 3,
-                            op: Op::Delete,
-                            query_advance: 0,
-                            target_advance: 3,
-                            repeats: 1,
-                        }),
+                        kind: 3,
+                        phase: 0,
+                        advance: 3,
+                        length: 0,
                     });
                 }
             } else if from_d >= 0 || bestfit {
                 current_d[j] = from_d;
                 if let Some((_, _, pd)) = parents.as_mut() {
-                    pd[j] = Some(P2GenomeParent {
+                    pd[j] = Some(CompactP2Parent {
                         state: State::D,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id: 5,
-                            op: Op::Delete,
-                            query_advance: 0,
-                            target_advance: 3,
-                            repeats: 1,
-                        }),
+                        kind: 5,
+                        phase: 0,
+                        advance: 3,
+                        length: 0,
                     });
                 }
             }
@@ -812,15 +881,12 @@ fn fill_p2g_row(
             if value > current_m[j] {
                 current_m[j] = value;
                 if let Some((pm, _, _)) = parents.as_mut() {
-                    pm[j] = Some(P2GenomeParent {
+                    pm[j] = Some(CompactP2Parent {
                         state,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id: 6,
-                            op: Op::Frameshift,
-                            query_advance: 0,
-                            target_advance: advance as u32,
-                            repeats: 1,
-                        }),
+                        kind: 6,
+                        phase: 0,
+                        advance: advance as u8,
+                        length: 0,
                     });
                 }
             }
@@ -831,26 +897,16 @@ fn fill_p2g_row(
                 (previous_i[j - 3], State::I),
                 (previous_d[j - 3], State::D),
             ]);
-            let value = add(
-                source,
-                protein_score(
-                    query.bases[row - 1],
-                    translate_dna(&bases[j - 3..j], 0)[0],
-                    scoring,
-                ),
-            );
+            let value = add(source, substitutions[cache.translated[j - 3] as usize]);
             if value >= current_m[j] {
                 current_m[j] = value;
                 if let Some((pm, _, _)) = parents.as_mut() {
-                    pm[j] = Some(P2GenomeParent {
+                    pm[j] = Some(CompactP2Parent {
                         state,
-                        fragment: TraceFragment::one(TraceRun {
-                            transition_id: 1,
-                            op: Op::Match,
-                            query_advance: 1,
-                            target_advance: 3,
-                            repeats: 1,
-                        }),
+                        kind: 1,
+                        phase: 0,
+                        advance: 3,
+                        length: 0,
                     });
                 }
             }
@@ -860,29 +916,23 @@ fn fill_p2g_row(
         if from_m >= from_i && (from_m >= 0 || bestfit) {
             current_i[j] = from_m;
             if let Some((_, pi, _)) = parents.as_mut() {
-                pi[j] = Some(P2GenomeParent {
+                pi[j] = Some(CompactP2Parent {
                     state: State::M,
-                    fragment: TraceFragment::one(TraceRun {
-                        transition_id: 2,
-                        op: Op::Insert,
-                        query_advance: 1,
-                        target_advance: 0,
-                        repeats: 1,
-                    }),
+                    kind: 2,
+                    phase: 0,
+                    advance: 0,
+                    length: 0,
                 });
             }
         } else if from_i >= 0 || bestfit {
             current_i[j] = from_i;
             if let Some((_, pi, _)) = parents.as_mut() {
-                pi[j] = Some(P2GenomeParent {
+                pi[j] = Some(CompactP2Parent {
                     state: State::I,
-                    fragment: TraceFragment::one(TraceRun {
-                        transition_id: 4,
-                        op: Op::Insert,
-                        query_advance: 1,
-                        target_advance: 0,
-                        repeats: 1,
-                    }),
+                    kind: 4,
+                    phase: 0,
+                    advance: 0,
+                    length: 0,
                 });
             }
         }
@@ -975,8 +1025,8 @@ fn fill_c2g_row(
                 let score = add(
                     add(candidate.score, acceptor),
                     protein_score(
-                        translate_dna(&query.bases[row - 3..row], 0)[0],
-                        translate_dna(&codon, 0)[0],
+                        translate_codon(&query.bases[row - 3..row]),
+                        translate_codon(&codon),
                         scoring,
                     ),
                 );
@@ -1139,8 +1189,8 @@ fn fill_c2g_row(
             let value = add(
                 value,
                 protein_score(
-                    translate_dna(&query.bases[row - 3..row], 0)[0],
-                    translate_dna(&bases[j - 3..j], 0)[0],
+                    translate_codon(&query.bases[row - 3..row]),
+                    translate_codon(&bases[j - 3..j]),
                     scoring,
                 ),
             );
@@ -1542,7 +1592,7 @@ fn fill_cdna_row(
                                                 &query.bases[row_index - 3..row_index],
                                                 0,
                                             )[0],
-                                            translate_dna(&codon, 0)[0],
+                                            translate_codon(&codon),
                                             scoring,
                                         ),
                                     ),
@@ -1635,8 +1685,8 @@ fn fill_cdna_row(
                     add(
                         score,
                         protein_score(
-                            translate_dna(&query.bases[row_index - 3..row_index], 0)[0],
-                            translate_dna(&target.bases[j - 3..j], 0)[0],
+                            translate_codon(&query.bases[row_index - 3..row_index]),
+                            translate_codon(&target.bases[j - 3..j]),
                             scoring,
                         ),
                     ),
@@ -2125,12 +2175,14 @@ fn score_checkpoints(
 fn score_est_checkpoints(
     query: &Sequence,
     bases: &[u8],
+    cache: &SpliceCache,
     intron: IntronScoring,
     budget_bytes: Option<u128>,
 ) -> (Vec<ScoreRow>, EndPoint, usize) {
     let (n, m) = (query.bases.len(), bases.len());
     let stride =
-        checkpoint_plan_with_parent(n, m, budget_bytes, size_of::<Option<EstParent>>()).stride;
+        checkpoint_plan_with_parent(n, m, budget_bytes, size_of::<Option<CompactEstParent>>())
+            .stride;
     let mut previous_m = vec![NEG_INF; m + 1];
     let mut previous_i = vec![NEG_INF; m + 1];
     let mut previous_d = vec![NEG_INF; m + 1];
@@ -2148,6 +2200,7 @@ fn score_est_checkpoints(
         fill_est_row(
             query,
             bases,
+            cache,
             row,
             intron,
             (row > 0).then_some((&previous_m, &previous_i, &previous_d)),
@@ -2179,6 +2232,7 @@ fn score_est_checkpoints(
 fn score_p2g_checkpoints(
     query: &Sequence,
     bases: &[u8],
+    cache: &SpliceCache,
     scoring: Scoring,
     intron: IntronScoring,
     bestfit: bool,
@@ -2186,7 +2240,8 @@ fn score_p2g_checkpoints(
 ) -> (Vec<ScoreRow>, EndPoint, usize) {
     let (n, m) = (query.bases.len(), bases.len());
     let stride =
-        checkpoint_plan_with_parent(n, m, budget_bytes, size_of::<Option<P2GenomeParent>>()).stride;
+        checkpoint_plan_with_parent(n, m, budget_bytes, size_of::<Option<CompactP2Parent>>())
+            .stride;
     let mut previous_m = vec![0; m + 1];
     let mut previous_i = vec![NEG_INF; m + 1];
     let mut previous_d = vec![NEG_INF; m + 1];
@@ -2210,6 +2265,7 @@ fn score_p2g_checkpoints(
         fill_p2g_row(
             query,
             bases,
+            cache,
             row,
             scoring,
             intron,
@@ -2374,7 +2430,7 @@ fn score_cdna_checkpoints(
             (history[0].ci[j], CdnaState::CodingI),
             (history[0].cd[j], CdnaState::CodingD),
         ] {
-            if (score, 0, j) > (end.score, end.i, end.j) {
+            if endpoint_key(score, 0, j, 0) > endpoint_key(end.score, end.i, end.j, 0) {
                 end = CdnaEndPoint {
                     i: 0,
                     j,
@@ -2405,7 +2461,7 @@ fn score_cdna_checkpoints(
                 (current.ci[j], CdnaState::CodingI),
                 (current.cd[j], CdnaState::CodingD),
             ] {
-                if score > end.score {
+                if endpoint_key(score, row, j, 0) > endpoint_key(end.score, end.i, end.j, 0) {
                     end = CdnaEndPoint {
                         i: row,
                         j,
@@ -2481,6 +2537,7 @@ fn rebuild_block(
 fn rebuild_est_block(
     query: &Sequence,
     bases: &[u8],
+    cache: &SpliceCache,
     intron: IntronScoring,
     checkpoint: &ScoreRow,
     end_row: usize,
@@ -2503,6 +2560,7 @@ fn rebuild_est_block(
         fill_est_row(
             query,
             bases,
+            cache,
             row,
             intron,
             Some((&previous_m, &previous_i, &previous_d)),
@@ -2522,15 +2580,17 @@ fn rebuild_est_block(
     (pm, pi, pd)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn rebuild_p2g_block(
     query: &Sequence,
     bases: &[u8],
+    cache: &SpliceCache,
     scoring: Scoring,
     intron: IntronScoring,
     bestfit: bool,
     checkpoint: &ScoreRow,
     end_row: usize,
-) -> P2ParentRows {
+) -> CompactP2ParentRows {
     let cols = bases.len() + 1;
     let rows = end_row - checkpoint.row;
     let mut pm = vec![None; (rows + 1) * cols];
@@ -2549,6 +2609,7 @@ fn rebuild_p2g_block(
         fill_p2g_row(
             query,
             bases,
+            cache,
             row,
             scoring,
             intron,
@@ -2972,7 +3033,25 @@ fn align_est2genome_checkpointed_one(
     strand: Strand,
     budget_bytes: Option<u128>,
 ) -> Alignment {
-    let (checkpoints, end, stride) = score_est_checkpoints(query, bases, intron, budget_bytes);
+    let intron = canonical_intron_scoring(intron);
+    let mut cache = SpliceCache::new(bases, intron);
+    let (mut checkpoints, mut end, mut stride) =
+        score_est_checkpoints(query, bases, &cache, intron, budget_bytes);
+    let mut reverse_splice = false;
+    if bases.len() >= intron.min_len as usize {
+        let reverse_cache = SpliceCache::est_direction(bases, intron, true);
+        let (reverse_checkpoints, reverse_end, reverse_stride) =
+            score_est_checkpoints(query, bases, &reverse_cache, intron, budget_bytes);
+        if endpoint_key(reverse_end.score, reverse_end.i, reverse_end.j, 0)
+            > endpoint_key(end.score, end.i, end.j, 0)
+        {
+            cache = reverse_cache;
+            checkpoints = reverse_checkpoints;
+            end = reverse_end;
+            stride = reverse_stride;
+            reverse_splice = true;
+        }
+    }
     let cols = bases.len() + 1;
     let (mut i, mut j, mut state) = (end.i, end.j, end.state);
     let final_state = state;
@@ -2984,7 +3063,7 @@ fn align_est2genome_checkpointed_one(
             .iter()
             .find(|checkpoint| checkpoint.row == block_start)
             .expect("EST checkpoint row");
-        let (pm, pi, pd) = rebuild_est_block(query, bases, intron, checkpoint, i);
+        let (pm, pi, pd) = rebuild_est_block(query, bases, &cache, intron, checkpoint, i);
         loop {
             if state == State::Stop || i == block_start {
                 break;
@@ -3000,6 +3079,7 @@ fn align_est2genome_checkpointed_one(
                 state = State::Stop;
                 break;
             };
+            let parent = parent.expand(query, bases, i, j, intron, &cache);
             let (query_advance, target_advance) = parent.fragment.advances();
             i -= query_advance;
             j -= target_advance;
@@ -3049,7 +3129,7 @@ fn align_est2genome_checkpointed_one(
             target.bases.len() as u64 - oriented_target_end,
         )
     };
-    Alignment {
+    let mut alignment = Alignment {
         query_id: query.id.clone(),
         target_id: target.id.clone(),
         query_start: i as u64,
@@ -3062,7 +3142,11 @@ fn align_est2genome_checkpointed_one(
         score: end.score,
         raw_trace,
         trace,
+    };
+    if reverse_splice {
+        reverse_est_trace(&mut alignment);
     }
+    alignment
 }
 
 /// Exact checkpointed local or best-fit protein-to-genome alignment.
@@ -3126,7 +3210,7 @@ fn align_protein_to_genome_low_memory_with_budget(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn align_p2g_checkpointed_one(
+pub(super) fn align_p2g_checkpointed_one(
     query: &Sequence,
     target: &Sequence,
     bases: &[u8],
@@ -3136,8 +3220,10 @@ fn align_p2g_checkpointed_one(
     bestfit: bool,
     budget_bytes: Option<u128>,
 ) -> Alignment {
+    let intron = canonical_intron_scoring(intron);
+    let cache = SpliceCache::new(bases, intron);
     let (checkpoints, end, stride) =
-        score_p2g_checkpoints(query, bases, scoring, intron, bestfit, budget_bytes);
+        score_p2g_checkpoints(query, bases, &cache, scoring, intron, bestfit, budget_bytes);
     let cols = bases.len() + 1;
     let (mut i, mut j, mut state) = (end.i, end.j, end.state);
     let final_state = state;
@@ -3149,7 +3235,9 @@ fn align_p2g_checkpointed_one(
             .iter()
             .find(|checkpoint| checkpoint.row == block_start)
             .expect("protein2genome checkpoint row");
-        let (pm, pi, pd) = rebuild_p2g_block(query, bases, scoring, intron, bestfit, checkpoint, i);
+        let (pm, pi, pd) = rebuild_p2g_block(
+            query, bases, &cache, scoring, intron, bestfit, checkpoint, i,
+        );
         loop {
             if state == State::Stop || i == block_start {
                 break;
@@ -3165,6 +3253,7 @@ fn align_p2g_checkpointed_one(
                 state = State::Stop;
                 break;
             };
+            let parent = parent.expand();
             let raw_fragment =
                 protein2genome_raw_fragment(parent, state, i, j, query, bases, scoring, intron);
             let (query_advance, target_advance) = parent.fragment.advances();
@@ -3813,14 +3902,12 @@ pub fn align_est2genome_database_with_dp_memory(
     both_strands: bool,
     memory_mb: usize,
 ) -> Vec<Alignment> {
-    queries
-        .iter()
-        .flat_map(|query| {
-            targets.iter().map(move |target| {
-                align_est2genome_with_dp_memory(query, target, intron, both_strands, memory_mb)
-            })
-        })
-        .collect()
+    try_align_dna_database(queries, targets, both_strands, false, |query, target| {
+        Ok::<_, std::convert::Infallible>(vec![align_est2genome_with_dp_memory(
+            query, target, intron, false, memory_mb,
+        )])
+    })
+    .expect("infallible EST alignment")
 }
 
 pub fn align_cdna_to_genome_database_with_dp_memory(

@@ -1,0 +1,311 @@
+{
+  "date": "2026-10-11",
+  "reference": "repository upstream Exonerate 2.4.0",
+  "mode": "exhaustive=yes, subopt=no, score=1; sugar/cigar/vulgar; explicit sequence types",
+  "commands": [
+    "cargo build --locked",
+    "python3 scripts/audit_compatibility.py --output /tmp/exonerate-final-audit.json",
+    "python3 scripts/audit_compatibility.py --seed 20261011 --cases 64 --output /tmp/exonerate-extended-fixed.json"
+  ],
+  "audits": [
+    {
+      "seed": 711,
+      "cases_per_suite": 16,
+      "summary": {
+        "ungapped": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:trans": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ner": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "est2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna:bestfit": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome:bestfit": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2coding": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "cdna2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "genome2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        }
+      },
+      "failures": []
+    },
+    {
+      "seed": 20261011,
+      "cases_per_suite": 64,
+      "summary": {
+        "ungapped": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:trans": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ner": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "est2genome": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna:bestfit": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome:bestfit": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2coding": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2genome": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "cdna2genome": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "genome2genome": {
+          "cases": 128,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:protein2protein": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global:protein2protein": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit:protein2protein": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local:protein2protein": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap:protein2protein": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        }
+      },
+      "failures": []
+    }
+  ],
+  "permanent_oracle_cases": 120,
+  "additional_ner_raw_trace_checks": {
+    "span_hints": [
+      [
+        10,
+        50000
+      ],
+      [
+        100,
+        100
+      ],
+      [
+        1,
+        1
+      ]
+    ],
+    "dp_memory_mb": [
+      32,
+      0
+    ]
+  },
+  "peak_rss_kib": {
+    "sequence_length": 500,
+    "model": "ner",
+    "full": 331432,
+    "checkpoint": 65776,
+    "outputs": "byte-identical"
+  },
+  "limitations": [
+    "Seeded short sequences do not prove compatibility for all inputs.",
+    "Some models do not use checkpoint traceback for dpmemory=0.",
+    "Random suboptimal enumeration excluded; existing fixed suboptimal tests retained."
+  ]
+}

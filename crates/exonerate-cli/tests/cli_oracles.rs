@@ -3004,8 +3004,8 @@ fn machine_readable_reports_cover_single_batch_and_audit_workflows() {
     let batch_evidence = fs::read_to_string(&batch_gff3).expect("read batch GFF3");
     assert!(batch_evidence.contains("Task=first"));
     assert!(batch_evidence.contains("Task=second"));
-    assert!(batch_evidence.contains("ID=alignment.first.t.1"));
-    assert!(batch_evidence.contains("ID=alignment.second.t.1"));
+    assert!(batch_evidence.contains("ID=alignment.5:first.1:t.1"));
+    assert!(batch_evidence.contains("ID=alignment.6:second.1:t.1"));
 
     let protein = fixture("protein-query.fa");
     let genome = fixture("protein-genome.fa");
@@ -3078,4 +3078,866 @@ fn machine_readable_reports_cover_single_batch_and_audit_workflows() {
     );
     assert_eq!(values[12], "expected");
     fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+#[test]
+fn orthology_uses_reference_coverage_and_the_winning_task() {
+    let directory = test_directory("orthology-reference-coverage");
+    let weak = directory.join("weak.fa");
+    fs::write(&weak, ">weak\nM\n").unwrap();
+    let genome = directory.join("flanked.fa");
+    let original = fs::read_to_string(fixture("protein-genome.fa")).unwrap();
+    let bases = original.lines().skip(1).collect::<String>();
+    fs::write(
+        &genome,
+        format!(">genome\n{}{}{}\n", "N".repeat(100), bases, "N".repeat(100)),
+    )
+    .unwrap();
+    let manifest = directory.join("tasks.tsv");
+    fs::write(&manifest, format!(
+        "task_id\tsample_id\tlocus_id\tcandidate_id\texpected_family\treference_family\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\nweak\tS\tL\tC\tF\tF\tprotein2genome\t{}\tweak\t{}\tgenome\nstrong\tS\tL\tC\tF\tF\tprotein2genome\t{}\tprotein\t{}\tgenome\n",
+        weak.display(), genome.display(), fixture("protein-query.fa").display(), genome.display()
+    )).unwrap();
+    let evidence = directory.join("evidence.tsv");
+    let report = directory.join("orthology.tsv");
+    run(&[
+        "--tasks",
+        manifest.to_str().unwrap(),
+        "--audit",
+        "protein-candidate",
+        "--result-tsv",
+        evidence.to_str().unwrap(),
+        "--orthology-report",
+        report.to_str().unwrap(),
+        "--forwardonly",
+    ]);
+    let report_text = fs::read_to_string(report).unwrap();
+    let row = report_text
+        .lines()
+        .nth(1)
+        .unwrap()
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(row[4], "accepted");
+    assert_eq!(row[6], "1.000000");
+    assert_eq!(row[12], "strong");
+    let evidence_text = fs::read_to_string(evidence).unwrap();
+    let best = evidence_text
+        .lines()
+        .find(|line| line.starts_with("strong\t"))
+        .unwrap()
+        .split('\t')
+        .collect::<Vec<_>>();
+    assert_eq!(row[5], best[12]);
+    assert!(best[18].parse::<f64>().unwrap() < 0.8);
+    assert_eq!(best[20], "0", "an intron is not an ordinary gap");
+    assert_eq!(best[22], "1");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn batch_failures_preserve_tsv_columns_and_order_across_thread_counts() {
+    let directory = test_directory("batch-failures");
+    let manifest = directory.join("tasks.tsv");
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    fs::write(&manifest, format!("task_id\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\nok\taffine:local\t{}\tq\t{}\tt\nbad\taffine:local\t{}\tmissing\t{}\tt\n", query.display(), target.display(), query.display(), target.display())).unwrap();
+    let mut previous = None;
+    for threads in ["1", "2"] {
+        let result = directory.join(format!("{threads}.tsv"));
+        run(&[
+            "--tasks",
+            manifest.to_str().unwrap(),
+            "--result-tsv",
+            result.to_str().unwrap(),
+            "--threads",
+            threads,
+            "--subopt",
+            "no",
+            "--forwardonly",
+            "--score",
+            "0",
+        ]);
+        let text = fs::read_to_string(result).unwrap();
+        let rows = text
+            .lines()
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|row| row.len() == 24));
+        assert_eq!(&rows[1][..2], &["ok", "aligned"]);
+        assert_eq!(&rows[2][..2], &["bad", "failed"]);
+        assert!(rows[2][23].contains("was not found"));
+        if let Some(previous) = &previous {
+            assert_eq!(&text, previous);
+        }
+        previous = Some(text);
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn duplicate_task_ids_are_rejected_before_outputs_are_created() {
+    let directory = test_directory("duplicate-task-ids");
+    let manifest = directory.join("tasks.tsv");
+    fs::write(&manifest, "task_id\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\nsame\tungapped\tx\tq\ty\tt\nsame\tungapped\tx\tq\ty\tt\n").unwrap();
+    let output = directory.join("out.tsv");
+    assert!(
+        run_failure(&[
+            "--tasks",
+            manifest.to_str().unwrap(),
+            "--result-tsv",
+            output.to_str().unwrap()
+        ])
+        .contains("duplicate task ID")
+    );
+    assert!(!output.exists());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_sequence_types_are_checked_independently_of_option_order() {
+    let query = fixture("protein-query.fa");
+    let target = fixture("protein-genome.fa");
+    for options in [
+        ["--querytype", "dna", "--model", "protein2dna"],
+        ["--model", "protein2dna", "--querytype", "dna"],
+        ["--targettype", "protein", "--model", "protein2dna"],
+        ["--model", "protein2dna", "--targettype", "protein"],
+    ] {
+        let mut args = options.to_vec();
+        args.extend([query.to_str().unwrap(), target.to_str().unwrap()]);
+        assert!(run_failure(&args).contains("requires a protein query and DNA target"));
+    }
+}
+
+#[test]
+fn heuristic_tied_regions_are_deterministic_and_padding_cannot_overflow() {
+    let directory = test_directory("heuristic-ties");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    fs::write(&query, ">q\nAAAAAAAAAAAA\n").unwrap();
+    fs::write(
+        &target,
+        format!(
+            ">t\n{}{}{}\n",
+            "A".repeat(12),
+            "G".repeat(100),
+            "A".repeat(12)
+        ),
+    )
+    .unwrap();
+    let mut previous = None;
+    for _ in 0..32 {
+        let output = run(&[
+            "--model",
+            "affine:local",
+            "--wordlen",
+            "12",
+            "--seedpadding",
+            "0",
+            "--subopt",
+            "no",
+            "--forwardonly",
+            "--score",
+            "0",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        if let Some(previous) = &previous {
+            assert_eq!(&output, previous);
+        }
+        previous = Some(output);
+    }
+    run(&[
+        "--model",
+        "affine:local",
+        "--seedpadding",
+        &usize::MAX.to_string(),
+        "--subopt",
+        "no",
+        "--forwardonly",
+        "--score",
+        "0",
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn buffered_output_errors_are_reported_for_hits_and_no_hits() {
+    let query = fixture("dna-query.fa");
+    let target = fixture("dna-target.fa");
+    for option in ["--result-tsv", "--evidence-gff3"] {
+        for score in ["0", "2147483647"] {
+            let error = run_failure(&[
+                "--model",
+                "affine:local",
+                "--subopt",
+                "no",
+                "--score",
+                score,
+                "--forwardonly",
+                option,
+                "/dev/full",
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]);
+            assert!(error.contains("No space left on device"));
+        }
+    }
+}
+
+#[test]
+fn protein2dna_local_alignment_can_start_in_each_target_reading_frame() {
+    let directory = test_directory("protein-reading-frame-starts");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    fs::write(&query, ">q\nHYR\n").unwrap();
+    fs::write(&target, ">t\nACGATAATG\n").unwrap();
+    for subopt in ["no", "yes"] {
+        let output = run(&[
+            "--model",
+            "protein2dna",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            subopt,
+            "--score",
+            "5",
+            "--forwardonly",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(output, "vulgar: q 2 3 . t 1 4 + 5 M 1 3\n");
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn gff3_reverse_queries_stay_in_bounds_and_use_unique_ids() {
+    let directory = test_directory("gff3-reverse-query");
+    let query = fixture("coding-query.fa");
+    let target = fixture("coding-genome.fa");
+    let mut previous = None;
+    for forward_coordinates in ["yes", "no"] {
+        let evidence = directory.join(format!("{forward_coordinates}.gff3"));
+        let output = run(&[
+            "--model",
+            "coding2genome",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--score",
+            "0",
+            "--showvulgar",
+            "no",
+            "--showtargetgff",
+            "yes",
+            "--showquerygff",
+            "yes",
+            "--forwardcoordinates",
+            forward_coordinates,
+            "--evidence-gff3",
+            evidence.to_str().unwrap(),
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        let evidence = fs::read_to_string(evidence).unwrap();
+        for document in [&output, &evidence] {
+            let mut ids = std::collections::HashSet::new();
+            let mut reverse_query_seen = false;
+            for line in document.lines().filter(|line| !line.starts_with('#')) {
+                let columns = line.split('\t').collect::<Vec<_>>();
+                assert_eq!(columns.len(), 9);
+                let reference_length = if columns[0] == "coding" { 117 } else { 151 };
+                let start = columns[3].parse::<usize>().unwrap();
+                let end = columns[4].parse::<usize>().unwrap();
+                assert!(
+                    start >= 1 && start <= end && end <= reference_length,
+                    "{line}"
+                );
+                let attributes = columns[8].split(';').collect::<Vec<_>>();
+                let id = attributes
+                    .iter()
+                    .find_map(|attribute| attribute.strip_prefix("ID="))
+                    .unwrap();
+                assert!(ids.insert(id), "duplicate GFF3 ID {id}");
+                let target = attributes
+                    .iter()
+                    .find_map(|attribute| attribute.strip_prefix("Target="))
+                    .unwrap()
+                    .split_whitespace()
+                    .collect::<Vec<_>>();
+                let target_length = if target[0] == "coding" { 117 } else { 151 };
+                let start = target[1].parse::<usize>().unwrap();
+                let end = target[2].parse::<usize>().unwrap();
+                assert!(start >= 1 && start <= end && end <= target_length, "{line}");
+                reverse_query_seen |= target[0] == "coding" && target.get(3) == Some(&"-");
+            }
+            assert!(reverse_query_seen);
+        }
+        if let Some((old_output, old_evidence)) = &previous {
+            assert_eq!(&output, old_output);
+            assert_eq!(&evidence, old_evidence);
+        }
+        previous = Some((output, evidence));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn gff3_identifiers_encode_utf8_and_reserved_characters_once() {
+    let directory = test_directory("gff3-utf8");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    let evidence = directory.join("out.gff3");
+    fs::write(&query, ">查询%\nATGATGATG\n").unwrap();
+    fs::write(&target, ">目;标\nATGATGATG\n").unwrap();
+    let output = run(&[
+        "--model",
+        "ungapped",
+        "--subopt",
+        "no",
+        "--score",
+        "0",
+        "--forwardonly",
+        "--showvulgar",
+        "no",
+        "--showgff",
+        "yes",
+        "--evidence-gff3",
+        evidence.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    let evidence = fs::read_to_string(evidence).unwrap();
+    for document in [&output, &evidence] {
+        assert!(document.is_ascii());
+        assert!(document.contains("%E7%9B%AE%3B%E6%A0%87\texonerate-rs"));
+        assert!(document.contains("Target=%E6%9F%A5%E8%AF%A2%25 1 9"));
+        assert!(!document.contains("%25E7"));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn report_paths_cannot_overwrite_inputs_or_each_other() {
+    let directory = test_directory("output-path-collisions");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    let output = directory.join("out");
+    fs::write(&query, ">q\nACGT\n").unwrap();
+    fs::write(&target, ">t\nACGT\n").unwrap();
+    let error = run_failure(&[
+        "--result-tsv",
+        query.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(error.contains("would overwrite an input"));
+    assert_eq!(fs::read_to_string(&query).unwrap(), ">q\nACGT\n");
+    let error = run_failure(&[
+        "--result-tsv",
+        output.to_str().unwrap(),
+        "--evidence-gff3",
+        output.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(error.contains("more than one report"));
+    assert!(!output.exists());
+    let manifest = directory.join("tasks.tsv");
+    fs::write(&manifest, format!("task_id\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\none\tungapped\t{}\tq\t{}\tt\n", query.display(), target.display())).unwrap();
+    let before = fs::read_to_string(&manifest).unwrap();
+    let error = run_failure(&[
+        "--tasks",
+        manifest.to_str().unwrap(),
+        "--result-tsv",
+        manifest.to_str().unwrap(),
+    ]);
+    assert!(error.contains("would overwrite an input"));
+    assert_eq!(fs::read_to_string(&manifest).unwrap(), before);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn empty_local_alignments_do_not_emit_invalid_gff3_intervals() {
+    let directory = test_directory("gff3-empty");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    let output = directory.join("out.gff3");
+    fs::write(&query, ">q\nA\n").unwrap();
+    fs::write(&target, ">t\nC\n").unwrap();
+    let tsv = directory.join("out.tsv");
+    let stdout = run(&[
+        "--subopt",
+        "no",
+        "--score",
+        "0",
+        "--forwardonly",
+        "--showvulgar",
+        "no",
+        "--showgff",
+        "yes",
+        "--showquerygff",
+        "yes",
+        "--result-tsv",
+        tsv.to_str().unwrap(),
+        "--evidence-gff3",
+        output.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(stdout.is_empty());
+    assert_eq!(
+        fs::read_to_string(tsv)
+            .unwrap()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .split('\t')
+            .nth(1),
+        Some("no_hit")
+    );
+    assert_eq!(fs::read_to_string(output).unwrap(), "##gff-version 3\n");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn ner_span_hints_do_not_limit_exhaustive_paths_or_atomic_reports() {
+    let directory = test_directory("ner-span-hints");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    fs::write(&query, ">q\nAGATACTTGGCTTTATCT\n").unwrap();
+    fs::write(&target, ">t\nAGATAAAGCCAAGTATCT\n").unwrap();
+    for (minimum, maximum) in [("10", "50000"), ("100", "100"), ("1", "1")] {
+        for budget in ["32", "0"] {
+            let output = run(&[
+                "--model",
+                "ner",
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "no",
+                "--revcomp",
+                "no",
+                "--score",
+                "1",
+                "--showalignment",
+                "no",
+                "--minner",
+                minimum,
+                "--maxner",
+                maximum,
+                "--dpmemory",
+                budget,
+                "--ryo",
+                "{%Pn|%Ps|%Pqa|%Pta\\n}",
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]);
+            assert_eq!(output, include_str!("fixtures/ner_short_span_ryo.expected"));
+        }
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn upstream_audit_counterexamples_match_in_both_memory_modes() {
+    let directory = test_directory("upstream-audit");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    for (index, line) in include_str!("fixtures/upstream_audit.tsv")
+        .lines()
+        .enumerate()
+    {
+        if line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 7);
+        fs::write(&query, format!(">q\n{}\n", fields[4])).unwrap();
+        fs::write(&target, format!(">t\n{}\n", fields[5])).unwrap();
+        for budget in ["32", "0"] {
+            let output = run(&[
+                "--model",
+                fields[0],
+                "--revcomp",
+                fields[1],
+                "--querytype",
+                fields[2],
+                "--targettype",
+                fields[3],
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "no",
+                "--score",
+                "1",
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "yes",
+                "--showcigar",
+                "yes",
+                "--showvulgar",
+                "yes",
+                "--dpmemory",
+                budget,
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]);
+            assert_eq!(
+                output,
+                fields[6].replace("\\n", "\n"),
+                "upstream fixture line {}, model {}, budget {}",
+                index + 1,
+                fields[0],
+                budget
+            );
+        }
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn hardlinked_outputs_cannot_overwrite_inputs_or_other_reports() {
+    let directory = test_directory("hardlink-protection");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    let output = directory.join("out.tsv");
+    let evidence = directory.join("out.gff");
+    fs::write(&query, ">q\nACGT\n").unwrap();
+    fs::write(&target, ">t\nACGT\n").unwrap();
+    fs::hard_link(&query, &output).unwrap();
+    let error = run_failure(&[
+        "--result-tsv",
+        output.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(error.contains("would overwrite an input"));
+    assert_eq!(fs::read_to_string(&query).unwrap(), ">q\nACGT\n");
+    fs::remove_file(&output).unwrap();
+    fs::write(&output, "preserve me").unwrap();
+    fs::hard_link(&output, &evidence).unwrap();
+    let error = run_failure(&[
+        "--result-tsv",
+        output.to_str().unwrap(),
+        "--evidence-gff3",
+        evidence.to_str().unwrap(),
+        query.to_str().unwrap(),
+        target.to_str().unwrap(),
+    ]);
+    assert!(error.contains("more than one report"));
+    assert_eq!(fs::read_to_string(&output).unwrap(), "preserve me");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn batch_gff_ids_have_unambiguous_component_boundaries() {
+    let directory = test_directory("gff-id-boundaries");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    let tasks = directory.join("tasks.tsv");
+    let result = directory.join("out.tsv");
+    let evidence = directory.join("out.gff");
+    fs::write(&query, ">q\nACGT\n").unwrap();
+    fs::write(&target, ">c\nACGT\n>b.c\nACGT\n").unwrap();
+    fs::write(&tasks, format!("task_id\tmodel\tquery_fasta\tquery_id\ttarget_fasta\ttarget_id\na.b\tungapped\t{}\tq\t{}\tc\na\tungapped\t{}\tq\t{}\tb.c\n", query.display(), target.display(), query.display(), target.display())).unwrap();
+    run(&[
+        "--tasks",
+        tasks.to_str().unwrap(),
+        "--result-tsv",
+        result.to_str().unwrap(),
+        "--evidence-gff3",
+        evidence.to_str().unwrap(),
+        "--exhaustive",
+        "yes",
+        "--subopt",
+        "no",
+        "--revcomp",
+        "no",
+        "--score",
+        "1",
+    ]);
+    let document = fs::read_to_string(evidence).unwrap();
+    let mut ids = std::collections::HashSet::new();
+    let mut parents = Vec::new();
+    for line in document.lines().filter(|line| !line.starts_with('#')) {
+        for attribute in line.split('\t').nth(8).unwrap().split(';') {
+            if let Some(id) = attribute.strip_prefix("ID=") {
+                assert!(ids.insert(id));
+            }
+            if let Some(parent) = attribute.strip_prefix("Parent=") {
+                parents.push(parent);
+            }
+        }
+    }
+    assert_eq!(ids.len(), 4);
+    assert!(parents.iter().all(|parent| ids.contains(parent)));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn pretty_reverse_coordinates_preserve_aligned_sequence() {
+    let directory = test_directory("pretty-coordinates");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    fs::write(&query, ">q\nAAAGTC\n").unwrap();
+    fs::write(&target, ">t\nGACT\n").unwrap();
+    for (forward, range, sugar) in [("yes", "6 -> 2", "6 2"), ("no", "0 -> 4", "0 4")] {
+        let output = run(&[
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--score",
+            "10",
+            "--showalignment",
+            "yes",
+            "--showsugar",
+            "yes",
+            "--forwardcoordinates",
+            forward,
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert!(output.contains(&format!("Query range: {range}")));
+        assert!(output.contains(&format!("sugar: q {sugar} - t 0 4 + 20")));
+        assert!(output.contains("GACT\n||||\nGACT"));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn ambiguous_codon_preserves_upstream_protein_hit() {
+    let directory = test_directory("ambiguous-codon");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    fs::write(&query, ">q\nA\n").unwrap();
+    fs::write(&target, ">t\nGCN\n").unwrap();
+    for memory in ["32", "0"] {
+        let output = run(&[
+            "--model",
+            "protein2dna",
+            "--querytype",
+            "protein",
+            "--targettype",
+            "dna",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--revcomp",
+            "no",
+            "--score",
+            "1",
+            "--dpmemory",
+            memory,
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(output, "vulgar: q 0 1 . t 0 3 + 4 M 1 3\n");
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn all_iupac_codons_match_original_translation_table() {
+    // Captured from upstream Translate_create(FALSE), standard genetic code.
+    let alphabet = b"-ACGTRYSWKMBDHVNXU";
+    let expected = include_str!("fixtures/iupac_translation.expected")
+        .trim()
+        .as_bytes();
+    let mut index = 0;
+    for &a in alphabet {
+        for &b in alphabet {
+            for &c in alphabet {
+                let codon = [a, b, c];
+                assert_eq!(
+                    exonerate_core::translate_dna(&codon, 0),
+                    [expected[index]],
+                    "codon {:?}",
+                    codon
+                );
+                assert_eq!(
+                    exonerate_core::translate_dna(&codon.map(|base| base.to_ascii_lowercase()), 0),
+                    [expected[index]]
+                );
+                index += 1;
+            }
+        }
+    }
+    assert_eq!(index, expected.len());
+}
+
+#[test]
+fn est_reverse_splice_direction_matches_upstream_with_both_memory_backends() {
+    let query = fixture("est-reverse-query.fa");
+    let target = fixture("est-reverse-target.fa");
+    for budget in ["0", "64"] {
+        let common = [
+            "--model",
+            "est2genome",
+            "--querytype",
+            "dna",
+            "--targettype",
+            "dna",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--score",
+            "0",
+            "--revcomp",
+            "no",
+            "--dpmemory",
+            budget,
+            "--showalignment",
+            "no",
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ];
+        let mut reports = common.to_vec();
+        reports.extend([
+            "--showsugar",
+            "yes",
+            "--showcigar",
+            "yes",
+            "--showvulgar",
+            "yes",
+        ]);
+        assert_eq!(run(&reports), include_str!("fixtures/est-reverse.expected"));
+        let mut raw = common.to_vec();
+        raw.extend([
+            "--showsugar",
+            "no",
+            "--showcigar",
+            "no",
+            "--showvulgar",
+            "no",
+            "--ryo",
+            "{%Pn|%Ps|%Pqa|%Pta\\n}",
+        ]);
+        assert_eq!(run(&raw), include_str!("fixtures/est-reverse-ryo.expected"));
+    }
+}
+
+#[test]
+fn seeded_spliced_search_does_not_invent_hits_without_hsps() {
+    let directory = test_directory("seedless-spliced");
+    let query = directory.join("query.fa");
+    let target = directory.join("target.fa");
+    let cases = [
+        ("est2genome", "dna", "CAGCCCTTCAACAGGGAACTCCAAACGAAGCGGGCTTGAGCCAACCTATGCATTACAAACACCTCTCGGTTACATATCCTTAAGATGGTTGCCGTATCCT".to_owned(),
+         "AAGCCCTTAAACAGGGCACTCCAACCGAAGCGAGCTTGAGACAACCTAAGCATTACCAACACCTATCGGTTAAATATCCTAAAGATGGATGCCGTAACCT".to_owned()),
+        ("protein2genome", "protein", "I".repeat(40), "GTG".repeat(40)),
+    ];
+    for (model, querytype, q, t) in cases {
+        fs::write(&query, format!(">q\n{q}\n")).unwrap();
+        fs::write(&target, format!(">t\n{t}\n")).unwrap();
+        for memory in ["0", "64"] {
+            // Original 2.4.0 emits no report for either input, even though
+            // exhaustive alignment scores exceed the reporting threshold.
+            assert_eq!(
+                run(&[
+                    "--model",
+                    model,
+                    "--querytype",
+                    querytype,
+                    "--targettype",
+                    "dna",
+                    "--exhaustive",
+                    "no",
+                    "--subopt",
+                    "no",
+                    "--revcomp",
+                    "no",
+                    "--score",
+                    "100",
+                    "--dpmemory",
+                    memory,
+                    "--showalignment",
+                    "no",
+                    "--showsugar",
+                    "yes",
+                    "--showvulgar",
+                    "yes",
+                    query.to_str().unwrap(),
+                    target.to_str().unwrap(),
+                ]),
+                ""
+            );
+        }
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn seeded_splice_phases_frameshifts_and_raw_steps_match_upstream() {
+    let directory = test_directory("seeded-extension-oracles");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    for (index, line) in include_str!("fixtures/seeded_extension.tsv")
+        .lines()
+        .enumerate()
+    {
+        if line.starts_with('#') {
+            continue;
+        }
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 5);
+        fs::write(&query, format!(">q\n{}\n", fields[1])).unwrap();
+        fs::write(&target, format!(">t\n{}\n", fields[2])).unwrap();
+        for budget in ["0", "64"] {
+            let output = run(&[
+                "--model",
+                fields[0],
+                "--querytype",
+                if fields[0] == "est2genome" {
+                    "dna"
+                } else {
+                    "protein"
+                },
+                "--targettype",
+                "dna",
+                "--exhaustive",
+                "no",
+                "--subopt",
+                "no",
+                "--revcomp",
+                "yes",
+                "--score",
+                "1",
+                "--maxintron",
+                fields[3],
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "yes",
+                "--showcigar",
+                "yes",
+                "--showvulgar",
+                "yes",
+                "--ryo",
+                "{%Pn|%Ps|%Pqa|%Pta\\n}",
+                "--dpmemory",
+                budget,
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]);
+            assert_eq!(
+                output,
+                fields[4].replace("\\n", "\n"),
+                "oracle {index}, budget {budget}"
+            );
+        }
+    }
+    fs::remove_dir_all(directory).unwrap();
 }

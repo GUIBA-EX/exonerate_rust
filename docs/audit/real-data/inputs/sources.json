@@ -1,0 +1,16 @@
+[
+  {
+    "accession": "NG_017013.2",
+    "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NG_017013.2&rettype=fasta&retmode=text",
+    "path": "docs/audit/real-data/inputs/NG_017013.2.fasta",
+    "sha256": "699e03d3e967b178ee83edea136bdf4a94e8b16e856e7840f72523d254caf4ef",
+    "length": 32772
+  },
+  {
+    "accession": "NG_013338.1",
+    "url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=nuccore&id=NG_013338.1&rettype=fasta&retmode=text",
+    "path": "docs/audit/real-data/inputs/NG_013338.1.fasta",
+    "sha256": "e3f2fbf91c5efc36826c0a255d70955b796f1337d761312b0ec18e6762b1145a",
+    "length": 18293
+  }
+]

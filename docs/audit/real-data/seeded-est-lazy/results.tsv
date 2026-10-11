@@ -1,0 +1,7 @@
+case	query_length	target_length	backend	status	seconds	peak_rss_kib	upstream_equal	memory_modes_equal
+calm.human.genomic.est2genome.exhaustive-no	2175	18293	upstream	ok	0.012775	6772	True	True
+calm.human.genomic.est2genome.exhaustive-no	2175	18293	rust_64mb	ok	0.008679	9408	True	True
+calm.human.genomic.est2genome.exhaustive-no	2175	18293	rust_0mb	ok	0.008366	9452	True	True
+p53.human.genomic.est2genome.exhaustive-no	1760	32772	upstream	ok	0.078139	8772	True	True
+p53.human.genomic.est2genome.exhaustive-no	1760	32772	rust_64mb	ok	0.030938	35800	True	True
+p53.human.genomic.est2genome.exhaustive-no	1760	32772	rust_0mb	ok	0.030816	36020	True	True

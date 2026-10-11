@@ -1,0 +1,73 @@
+case	query_length	target_length	backend	status	seconds	peak_rss_kib	upstream_equal	memory_modes_equal
+calm.human.protein2dna	149	2175	upstream	ok	0.02	21532	True	True
+calm.human.protein2dna	149	2175	rust_64mb	ok	0.02	18168	True	True
+calm.human.protein2dna	149	2175	rust_0mb	ok	0.02	17896	True	True
+calm.human.protein2dna:bestfit	149	2175	upstream	ok	0.01	21544	True	True
+calm.human.protein2dna:bestfit	149	2175	rust_64mb	ok	0.02	18104	True	True
+calm.human.protein2dna:bestfit	149	2175	rust_0mb	ok	0.02	18372	True	True
+calm.human.protein2genome	149	2175	upstream	ok	0.05	39452	True	True
+calm.human.protein2genome	149	2175	rust_64mb	ok	0.5	7944	True	True
+calm.human.protein2genome	149	2175	rust_0mb	ok	0.5	7848	True	True
+calm.human.dna-self	2175	2175	upstream	ok	0.07	68928	True	True
+calm.human.dna-self	2175	2175	rust_64mb	ok	8.7	2804	True	True
+calm.human.dna-self	2175	2175	rust_0mb	ok	8.7	3048	True	True
+p53.human.protein2dna	393	1760	upstream	ok	0.04	41648	True	True
+p53.human.protein2dna	393	1760	rust_64mb	ok	0.06	35224	True	True
+p53.human.protein2dna	393	1760	rust_0mb	ok	0.05	35468	True	True
+p53.human.protein2dna:bestfit	393	1760	upstream	ok	0.04	41576	True	True
+p53.human.protein2dna:bestfit	393	1760	rust_64mb	ok	0.06	35328	True	True
+p53.human.protein2dna:bestfit	393	1760	rust_0mb	ok	0.06	35576	True	True
+p53.human.protein2genome	393	1760	upstream	ok	0.11	54528	True	True
+p53.human.protein2genome	393	1760	rust_64mb	ok	1.03	8848	True	True
+p53.human.protein2genome	393	1760	rust_0mb	ok	1.02	8944	True	True
+p53.human.dna-self	1760	1760	upstream	ok	0.05	69048	True	True
+p53.human.dna-self	1760	1760	rust_64mb	ok	4.62	3012	True	True
+p53.human.dna-self	1760	1760	rust_0mb	ok	4.62	2800	True	True
+htrt.human.protein2dna	1132	4015	upstream	ok	0.23	68516	True	True
+htrt.human.protein2dna	1132	4015	rust_64mb	ok	0.37	216324	True	True
+htrt.human.protein2dna	1132	4015	rust_0mb	ok	0.37	216344	True	True
+htrt.human.protein2dna:bestfit	1132	4015	upstream	ok	0.21	68824	True	True
+htrt.human.protein2dna:bestfit	1132	4015	rust_64mb	ok	0.39	215828	True	True
+htrt.human.protein2dna:bestfit	1132	4015	rust_0mb	ok	0.39	216324	True	True
+htrt.human.protein2genome	1132	4015	upstream	ok	0.7	68892	True	True
+htrt.human.protein2genome	1132	4015	rust_64mb	ok	7.12	23280	True	True
+htrt.human.protein2genome	1132	4015	rust_0mb	ok	7.12	23196	True	True
+htrt.human.dna-self	4015	4015	upstream	ok	0.21	68484	True	True
+htrt.human.dna-self	4015	4015	rust_64mb	ok	56.99	2804	True	True
+htrt.human.dna-self	4015	4015	rust_0mb	ok	54.75	3064	True	True
+tube.drome.protein2dna	462	2011	upstream	ok	0.06	54652	True	True
+tube.drome.protein2dna	462	2011	rust_64mb	ok	0.07	46528	True	True
+tube.drome.protein2dna	462	2011	rust_0mb	ok	0.07	46520	True	True
+tube.drome.protein2dna:bestfit	462	2011	upstream	ok	0.05	54516	True	True
+tube.drome.protein2dna:bestfit	462	2011	rust_64mb	ok	0.08	46892	True	True
+tube.drome.protein2dna:bestfit	462	2011	rust_0mb	ok	0.08	46812	True	True
+tube.drome.protein2genome	462	2011	upstream	ok	0.14	69212	True	True
+tube.drome.protein2genome	462	2011	rust_64mb	ok	1.42	9980	True	True
+tube.drome.protein2genome	462	2011	rust_0mb	ok	1.42	10016	True	True
+tube.drome.dna-self	2011	2011	upstream	ok	0.07	68784	True	True
+tube.drome.dna-self	2011	2011	rust_64mb	ok	6.9	2964	True	True
+tube.drome.dna-self	2011	2011	rust_0mb	ok	6.89	2768	True	True
+calm.human.genomic.protein2genome.exhaustive-yes	149	18293	upstream	ok	0.35	69400	True	True
+calm.human.genomic.protein2genome.exhaustive-yes	149	18293	rust_64mb	ok	4.19	40712	True	True
+calm.human.genomic.protein2genome.exhaustive-yes	149	18293	rust_0mb	ok	4.17	40724	True	True
+calm.human.genomic.est2genome.exhaustive-yes	2175	18293	upstream	ok	5.86	73452	True	True
+calm.human.genomic.est2genome.exhaustive-yes	2175	18293	rust_64mb	ok	42.66	166000	True	True
+calm.human.genomic.est2genome.exhaustive-yes	2175	18293	rust_0mb	ok	42.87	166020	True	True
+calm.human.genomic.protein2genome.exhaustive-no	149	18293	upstream	ok	0.0	5832	True	True
+calm.human.genomic.protein2genome.exhaustive-no	149	18293	rust_64mb	ok	3.11	1408548	True	True
+calm.human.genomic.protein2genome.exhaustive-no	149	18293	rust_0mb	ok	3.12	1407988	True	True
+calm.human.genomic.est2genome.exhaustive-no	2175	18293	upstream	ok	0.01	6724		
+calm.human.genomic.est2genome.exhaustive-no	2175	18293	rust_64mb	memory_limit_failure	1.11	314652		
+calm.human.genomic.est2genome.exhaustive-no	2175	18293	rust_0mb	memory_limit_failure	1.11	314596		
+p53.human.genomic.protein2genome.exhaustive-yes	393	32772	upstream	ok	1.59	69628	True	True
+p53.human.genomic.protein2genome.exhaustive-yes	393	32772	rust_64mb	ok	20.14	106336	True	True
+p53.human.genomic.protein2genome.exhaustive-yes	393	32772	rust_0mb	ok	20.09	105884	True	True
+p53.human.genomic.est2genome.exhaustive-yes	1760	32772	upstream	ok	7.8	73752		
+p53.human.genomic.est2genome.exhaustive-yes	1760	32772	rust_64mb	timeout	60.001			
+p53.human.genomic.est2genome.exhaustive-yes	1760	32772	rust_0mb	timeout	60.001			
+p53.human.genomic.protein2genome.exhaustive-no	393	32772	upstream	ok	0.02	10440	True	True
+p53.human.genomic.protein2genome.exhaustive-no	393	32772	rust_64mb	ok	15.24	6616836	True	True
+p53.human.genomic.protein2genome.exhaustive-no	393	32772	rust_0mb	ok	15.21	6618592	True	True
+p53.human.genomic.est2genome.exhaustive-no	1760	32772	upstream	ok	0.07	8464		
+p53.human.genomic.est2genome.exhaustive-no	1760	32772	rust_64mb	memory_limit_failure	1.14	455208		
+p53.human.genomic.est2genome.exhaustive-no	1760	32772	rust_0mb	memory_limit_failure	1.13	454856		

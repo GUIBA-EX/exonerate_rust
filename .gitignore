@@ -1,2 +1,9 @@
 /target/
 *.profraw
+
+__pycache__/
+# Reports embed commands and outputs; omit redundant per-run files.
+/docs/audit/real-data/**/runs/
+/docs/audit/real-data/**/*-runs/
+/docs/audit/real-data/**/*-batch/
+/docs/audit/real-data/batch/

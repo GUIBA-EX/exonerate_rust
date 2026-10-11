@@ -1,0 +1,21 @@
+{
+  "seed": 711,
+  "cases_per_suite": 60,
+  "ambiguous": false,
+  "heuristic": true,
+  "summary": {
+    "est2genome": {
+      "cases": 120,
+      "upstream_differences": 0,
+      "checkpoint_differences": 0,
+      "execution_errors": 0
+    },
+    "protein2genome": {
+      "cases": 120,
+      "upstream_differences": 0,
+      "checkpoint_differences": 0,
+      "execution_errors": 0
+    }
+  },
+  "failures": []
+}

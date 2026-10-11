@@ -3,25 +3,25 @@ use exonerate_core::{
     align_cdna_to_genome_database_heuristic, align_cdna_to_genome_database_suboptimal,
     align_cdna_to_genome_database_with_dp_memory_stranded,
     align_coding_to_genome_database_heuristic, align_coding_to_genome_database_suboptimal,
-    align_coding_to_genome_database_with_dp_memory, align_coding2coding_database,
-    align_coding2coding_database_suboptimal, align_database_affine_suboptimal,
-    align_database_heuristic, align_database_with_dp_memory, align_est2genome_database_heuristic,
-    align_est2genome_database_suboptimal, align_est2genome_database_with_dp_memory,
-    align_genome_to_genome_database_heuristic_stranded,
+    align_coding_to_genome_database_with_dp_memory, align_coding2coding_database_stranded,
+    align_coding2coding_database_suboptimal_stranded, align_database_affine_suboptimal,
+    align_database_heuristic, align_database_with_dp_memory,
+    align_est2genome_database_heuristic_with_dp_memory, align_est2genome_database_suboptimal,
+    align_est2genome_database_with_dp_memory, align_genome_to_genome_database_heuristic_stranded,
     align_genome_to_genome_database_heuristic_stranded_with_rolling_scores,
     align_genome_to_genome_database_stranded, align_genome_to_genome_database_suboptimal_stranded,
     align_ner_database_suboptimal_with_dp_memory, align_ner_database_with_dp_memory,
     align_protein_database_affine_suboptimal, align_protein_database_with_dp_memory,
     align_protein_to_dna_database, align_protein_to_dna_database_suboptimal,
-    align_protein_to_genome_bestfit_database_heuristic, align_protein_to_genome_database_heuristic,
+    align_protein_to_genome_database_heuristic_with_dp_memory,
     align_protein_to_genome_database_suboptimal, align_protein_to_genome_database_with_dp_memory,
     align_protein_ungapped_database_suboptimal, align_ungapped_database_suboptimal,
     align_ungapped_translated_database_suboptimal_with_dp_memory,
     align_ungapped_translated_database_with_dp_memory, dna_self_score, dna_substitution_score,
-    protein_self_score, protein_substitution_score, read_fasta, reverse_complement, translate_dna,
-    translated_self_score,
+    gff3_field, protein_self_score, protein_substitution_score, read_fasta, reverse_complement,
+    translate_dna, translated_self_score,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Command, ExitCode};
@@ -756,6 +756,18 @@ fn transition_metadata(model: &str, transition_id: u16) -> (&'static str, &'stat
             9 => ("insert to match forward", "none"),
             10 => ("delete to match forward", "none"),
             11 => ("match to end forward", "none"),
+            12 => ("start to match reverse", "none"),
+            13 => ("match reverse", "match"),
+            14 => ("match to insert reverse", "gap"),
+            15 => ("match to delete reverse", "gap"),
+            16 => ("insert reverse", "gap"),
+            17 => ("delete reverse", "gap"),
+            18 => ("(START) to intron reverse", "3'ss"),
+            19 => ("target intron loop reverse", "intron"),
+            20 => ("intron reverse to (END)", "5'ss"),
+            21 => ("insert to match reverse", "none"),
+            22 => ("delete to match reverse", "none"),
+            23 => ("match to end reverse", "none"),
             _ => ("unknown", "none"),
         };
     }
@@ -769,10 +781,10 @@ fn transition_metadata(model: &str, transition_id: u16) -> (&'static str, &'stat
             5 => ("delete", "gap"),
             6 => ("insert to match", "none"),
             7 => ("delete to match", "none"),
-            8 => ("frameshift open 1 p2g", "frameshift"),
-            9 => ("frameshift open 2 p2g", "frameshift"),
-            10 => ("frameshift close 0 p2g", "none"),
-            11 => ("frameshift close 3 p2g", "frameshift"),
+            8 => ("frameshift open 1 p2d", "frameshift"),
+            9 => ("frameshift open 2 p2d", "frameshift"),
+            10 => ("frameshift close 0 p2d", "none"),
+            11 => ("frameshift close 3 p2d", "frameshift"),
             12 => ("match to end", "none"),
             101 => ("(START) to phase1pre phase-T", "split codon"),
             102 => ("(START) to phase2pre phase-T", "split codon"),
@@ -838,6 +850,15 @@ fn transition_metadata(model: &str, transition_id: u16) -> (&'static str, &'stat
             2 => ("match to end", "none"),
             _ => ("unknown", "none"),
         };
+    }
+    if model.starts_with("NER:") {
+        match transition_id {
+            9 => return ("match to ner", "ner"),
+            10 => return ("ner to match", "none"),
+            11 => return ("ner loop insert", "ner"),
+            12 => return ("ner loop delete", "ner"),
+            _ => {}
+        }
     }
     match transition_id {
         0 => ("start to match", "none"),
@@ -1005,6 +1026,24 @@ fn render_ryo(
     } else {
         alignment.raw_trace.clone()
     };
+    // EST stores a whole intron loop as a compact span. RYO describes each
+    // original C4 transition, whose loop consumes one target base.
+    let raw_steps: Vec<_> = raw_steps
+        .into_iter()
+        .flat_map(|step| {
+            if model == "est2genome" && matches!(step.transition_id, 7 | 19) {
+                std::iter::repeat_n(
+                    RawStep {
+                        target_advance: 1,
+                        ..step
+                    },
+                    step.target_advance as usize,
+                )
+            } else {
+                std::iter::repeat_n(step, 1)
+            }
+        })
+        .collect();
     for step in &raw_steps {
         output.push_str(&render_transition_ryo(
             &body,
@@ -1070,20 +1109,68 @@ fn tsv_field(value: &str) -> String {
         .collect()
 }
 
-const RESULT_TSV_HEADER: &str = "task_id\tstatus\tmodel\trank\tquery_id\ttarget_id\tquery_start\tquery_end\tquery_strand\ttarget_start\ttarget_end\ttarget_strand\tscore\tquery_length\ttarget_length\tquery_aligned\ttarget_aligned\tquery_coverage\ttarget_coverage\tquery_gap_bases\ttarget_gap_bases\tframeshift_bases\tintron_count";
-
-fn gff3_field(value: &str) -> String {
-    value
-        .bytes()
-        .flat_map(|byte| match byte {
-            b';' | b'=' | b'&' | b',' | b'%' | b'\t' | b'\n' | b'\r' => {
-                format!("%{byte:02X}").bytes().collect::<Vec<_>>()
+fn validate_output_paths(inputs: &[&str], outputs: &[Option<&str>]) -> Result<(), String> {
+    let resolve = |value: &str| -> Result<std::path::PathBuf, String> {
+        let path = std::path::Path::new(value);
+        if path.exists() {
+            return path.canonicalize().map_err(|error| error.to_string());
+        }
+        let parent = path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        Ok(parent
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            .join(path.file_name().ok_or("output path has no filename")?))
+    };
+    let input_paths = inputs
+        .iter()
+        .filter_map(|input| std::fs::canonicalize(input).ok())
+        .collect::<HashSet<_>>();
+    #[cfg(unix)]
+    let identity = |path: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+    };
+    #[cfg(unix)]
+    let input_ids: HashSet<_> = input_paths
+        .iter()
+        .filter_map(|path| identity(path))
+        .collect();
+    #[cfg(unix)]
+    let mut output_ids = HashSet::new();
+    let mut output_paths = HashSet::new();
+    for output in outputs.iter().flatten() {
+        let path = resolve(output)?;
+        #[cfg(unix)]
+        if let Some(id) = identity(&path) {
+            if input_ids.contains(&id) {
+                return Err(format!(
+                    "output path {output:?} would overwrite an input file"
+                ));
             }
-            _ => vec![byte],
-        })
-        .map(char::from)
-        .collect()
+            if !output_ids.insert(id) {
+                return Err(format!(
+                    "output path {output:?} is used by more than one report"
+                ));
+            }
+        }
+        if input_paths.contains(&path) {
+            return Err(format!(
+                "output path {output:?} would overwrite an input file"
+            ));
+        }
+        if !output_paths.insert(path) {
+            return Err(format!(
+                "output path {output:?} is used by more than one report"
+            ));
+        }
+    }
+    Ok(())
 }
+
+const RESULT_TSV_HEADER: &str = "task_id\tstatus\tmodel\trank\tquery_id\ttarget_id\tquery_start\tquery_end\tquery_strand\ttarget_start\ttarget_end\ttarget_strand\tscore\tquery_length\ttarget_length\tquery_aligned\ttarget_aligned\tquery_coverage\ttarget_coverage\tquery_gap_bases\ttarget_gap_bases\tframeshift_bases\tintron_count";
 
 fn alignment_metrics(alignment: &Alignment) -> (u64, u64, u64, u64, u64, u64) {
     let mut query_aligned = 0_u64;
@@ -1097,10 +1184,10 @@ fn alignment_metrics(alignment: &Alignment) -> (u64, u64, u64, u64, u64, u64) {
         let target_advance = u64::from(run.target_advance) * run.repeats;
         query_aligned += query_advance;
         target_aligned += target_advance;
-        if target_advance == 0 {
+        if target_advance == 0 && matches!(run.op, Op::Insert | Op::Delete) {
             query_gap_bases += query_advance;
         }
-        if query_advance == 0 {
+        if query_advance == 0 && matches!(run.op, Op::Insert | Op::Delete) {
             target_gap_bases += target_advance;
         }
         if run.op == Op::Frameshift {
@@ -1143,7 +1230,10 @@ fn write_result_tsv(
         File::create(path).map_err(|error| format!("create result TSV {path:?}: {error}"))?;
     let mut output = io::BufWriter::new(file);
     writeln!(output, "{RESULT_TSV_HEADER}").map_err(|error| error.to_string())?;
-    if alignments.is_empty() {
+    if alignments.iter().all(|alignment| {
+        alignment.query_start == alignment.query_end
+            || alignment.target_start == alignment.target_end
+    }) {
         let query_id = queries.first().map_or("", |sequence| sequence.id.as_str());
         let target_id = targets.first().map_or("", |sequence| sequence.id.as_str());
         writeln!(
@@ -1155,9 +1245,14 @@ fn write_result_tsv(
             tsv_field(target_id),
         )
         .map_err(|error| error.to_string())?;
-        return Ok(());
+        return output.flush().map_err(|error| error.to_string());
     }
     for (index, alignment) in alignments.iter().enumerate() {
+        if alignment.query_start == alignment.query_end
+            || alignment.target_start == alignment.target_end
+        {
+            continue;
+        }
         let query_length = queries
             .iter()
             .find(|sequence| sequence.id == alignment.query_id)
@@ -1210,78 +1305,29 @@ fn write_result_tsv(
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    output.flush().map_err(|error| error.to_string())
 }
 
 fn evidence_gff3(alignment: &Alignment, id: &str, task_id: Option<&str>, rank: usize) -> String {
     let (query_aligned, target_aligned, _, _, frameshift_bases, intron_count) =
         alignment_metrics(alignment);
-    let (start, end) = if alignment.target_start <= alignment.target_end {
-        (alignment.target_start + 1, alignment.target_end)
-    } else {
-        (alignment.target_end + 1, alignment.target_start)
-    };
     let task_attribute = task_id
         .filter(|task| !task.is_empty())
         .map(|task| format!(";Task={}", gff3_field(task)))
         .unwrap_or_default();
-    let mut lines = vec![format!(
-        "{}\texonerate-rs\tmatch\t{}\t{}\t{}\t{}\t.\tID={};Target={} {} {}{};Rank={};QueryAligned={};TargetAligned={};FrameshiftBases={};IntronCount={}",
-        gff3_field(&alignment.target_id),
-        start,
-        end,
-        alignment.score,
-        alignment.target_strand.symbol(),
-        gff3_field(id),
-        gff3_field(&alignment.query_id),
-        alignment.query_start + 1,
-        alignment.query_end,
-        task_attribute,
-        rank,
-        query_aligned,
-        target_aligned,
-        frameshift_bases,
-        intron_count,
-    )];
-    let mut query = alignment.query_start;
-    let mut target = if alignment.target_strand == Strand::Reverse {
-        alignment.target_start.max(alignment.target_end)
-    } else {
-        alignment.target_start.min(alignment.target_end)
-    };
-    let mut part = 0_u64;
-    for run in &alignment.trace {
-        let query_advance = u64::from(run.query_advance) * run.repeats;
-        let target_advance = u64::from(run.target_advance) * run.repeats;
-        if query_advance > 0 && target_advance > 0 {
-            part += 1;
-            let (left, right) = if alignment.target_strand == Strand::Reverse {
-                (target.saturating_sub(target_advance) + 1, target)
-            } else {
-                (target + 1, target + target_advance)
-            };
-            lines.push(format!(
-                "{}\texonerate-rs\tmatch_part\t{}\t{}\t.\t{}\t.\tID={}.part{};Parent={};Target={} {} {}",
-                gff3_field(&alignment.target_id),
-                left.min(right),
-                left.max(right),
-                alignment.target_strand.symbol(),
-                gff3_field(id),
-                part,
-                gff3_field(id),
-                gff3_field(&alignment.query_id),
-                query + 1,
-                query + query_advance,
-            ));
-        }
-        query += query_advance;
-        target = if alignment.target_strand == Strand::Reverse {
-            target.saturating_sub(target_advance)
-        } else {
-            target + target_advance
-        };
+    let rendered = alignment.gff3_with_id(id);
+    if rendered.is_empty() {
+        return rendered;
     }
-    lines.join("\n")
+    let (parent, parts) = rendered.split_once('\n').unwrap_or((&rendered, ""));
+    let mut result = format!(
+        "{parent}{task_attribute};Rank={rank};QueryAligned={query_aligned};TargetAligned={target_aligned};FrameshiftBases={frameshift_bases};IntronCount={intron_count}"
+    );
+    if !parts.is_empty() {
+        result.push('\n');
+        result.push_str(parts);
+    }
+    result
 }
 
 fn write_evidence_gff3(
@@ -1297,15 +1343,19 @@ fn write_evidence_gff3(
     for (index, alignment) in alignments.iter().enumerate() {
         let rank = alignment_rank(alignments, index, best_n);
         let id = format!(
-            "alignment.{}.{}.{}",
-            gff3_field(task_id.unwrap_or("alignment")),
-            gff3_field(&alignment.target_id),
+            "alignment.{}:{}.{}:{}.{}",
+            task_id.unwrap_or("alignment").len(),
+            task_id.unwrap_or("alignment"),
+            alignment.target_id.len(),
+            alignment.target_id,
             index + 1,
         );
-        writeln!(output, "{}", evidence_gff3(alignment, &id, task_id, rank))
-            .map_err(|error| error.to_string())?;
+        let evidence = evidence_gff3(alignment, &id, task_id, rank);
+        if !evidence.is_empty() {
+            writeln!(output, "{evidence}").map_err(|error| error.to_string())?;
+        }
     }
-    Ok(())
+    output.flush().map_err(|error| error.to_string())
 }
 
 #[derive(Clone)]
@@ -1331,6 +1381,7 @@ struct OrthologyMetadata {
 fn read_tasks(path: &str) -> Result<Vec<Task>, String> {
     let file = File::open(path).map_err(|error| format!("open task manifest {path:?}: {error}"))?;
     let mut tasks = Vec::new();
+    let mut task_ids = HashSet::new();
     let mut header_seen = false;
     let mut expected_orthology = false;
     for (line_number, line) in BufReader::new(file).lines().enumerate() {
@@ -1404,6 +1455,13 @@ fn read_tasks(path: &str) -> Result<Vec<Task>, String> {
                     None,
                 )
             };
+        if !task_ids.insert(fields[0].to_owned()) {
+            return Err(format!(
+                "duplicate task ID {:?} on line {}",
+                fields[0],
+                line_number + 1
+            ));
+        }
         tasks.push(Task {
             id: fields[0].to_owned(),
             model,
@@ -1457,7 +1515,7 @@ fn best_alignment_evidence(rows: &[String]) -> (Option<AlignmentEvidence>, bool)
             Some("aligned") => {
                 let evidence = match (
                     fields.get(12).and_then(|value| value.parse().ok()),
-                    fields.get(18).and_then(|value| value.parse().ok()),
+                    fields.get(17).and_then(|value| value.parse().ok()),
                     fields.get(21).and_then(|value| value.parse().ok()),
                     fields.get(22).and_then(|value| value.parse().ok()),
                 ) {
@@ -1548,9 +1606,12 @@ fn write_orthology_report(
             }
         }
         let expected = by_family.get(&first.expected_family).copied();
-        let expected_task_id = observations
-            .iter()
-            .find(|observation| observation.reference_family == first.expected_family)
+        let expected_task_id = expected
+            .or_else(|| {
+                observations
+                    .iter()
+                    .find(|observation| observation.reference_family == first.expected_family)
+            })
             .map_or("", |observation| observation.task_id.as_str());
         let competitor = by_family
             .iter()
@@ -1580,14 +1641,14 @@ fn write_orthology_report(
                     (
                         Some(family),
                         Some(competitor.score),
-                        Some(evidence.score - competitor.score),
+                        Some(i64::from(evidence.score) - i64::from(competitor.score)),
                     )
                 });
             let status = if competitor_score.is_some_and(|score| score >= evidence.score) {
                 "unexpected_family"
             } else if evidence.coverage < min_coverage {
                 "fragment"
-            } else if delta.is_some_and(|value| value < min_delta) {
+            } else if delta.is_some_and(|value| value < i64::from(min_delta)) {
                 "ambiguous"
             } else {
                 "accepted"
@@ -1635,7 +1696,7 @@ fn write_orthology_report(
         )
         .map_err(|error| error.to_string())?;
     }
-    Ok(())
+    output.flush().map_err(|error| error.to_string())
 }
 
 fn run_task_batch(command_args: &[String]) -> Result<(), String> {
@@ -1735,6 +1796,18 @@ fn run_task_batch(command_args: &[String]) -> Result<(), String> {
     let task_path = task_path.ok_or("--tasks requires a manifest path")?;
     let result_path = result_path.ok_or("--tasks requires --result-tsv FILE")?;
     let tasks = Arc::new(read_tasks(&task_path)?);
+    let mut input_paths = vec![task_path.as_str()];
+    for task in tasks.iter() {
+        input_paths.extend([task.query_fasta.as_str(), task.target_fasta.as_str()]);
+    }
+    validate_output_paths(
+        &input_paths,
+        &[
+            Some(&result_path),
+            evidence_path.as_deref(),
+            orthology_path.as_deref(),
+        ],
+    )?;
     if orthology_path.is_some()
         && !common_args
             .windows(2)
@@ -1867,9 +1940,15 @@ fn run_task_batch(command_args: &[String]) -> Result<(), String> {
     writeln!(output, "{RESULT_TSV_HEADER}\terror").map_err(|error| error.to_string())?;
     for result in &results {
         for row in &result.rows {
-            writeln!(output, "{row}\t").map_err(|error| error.to_string())?;
+            let suffix = if row.split('\t').nth(1) == Some("failed") {
+                ""
+            } else {
+                "\t"
+            };
+            writeln!(output, "{row}{suffix}").map_err(|error| error.to_string())?;
         }
     }
+    output.flush().map_err(|error| error.to_string())?;
     if let Some(path) = orthology_path {
         write_orthology_report(
             &path,
@@ -1889,6 +1968,7 @@ fn run_task_batch(command_args: &[String]) -> Result<(), String> {
                 writeln!(output, "{}", result.gff3).map_err(|error| error.to_string())?;
             }
         }
+        output.flush().map_err(|error| error.to_string())?;
     }
     fs::remove_dir_all(&temporary)
         .map_err(|error| format!("remove batch temporary directory: {error}"))?;
@@ -1900,8 +1980,9 @@ fn pretty_alignment(
     query: &Sequence,
     target: &Sequence,
     report_model: &str,
+    forward_coordinates: bool,
 ) -> String {
-    let rendered = alignment.pretty(query, target);
+    let rendered = alignment.pretty_with_coordinates(query, target, forward_coordinates);
     // Upstream's generic affine views omit a model line, while the composed
     // and translated model views identify their concrete C4 graph there.
     let needs_model_line = !matches!(
@@ -1994,58 +2075,102 @@ fn run() -> Result<(), String> {
                 match selected.as_str() {
                     "ungapped:trans" | "u:t" => {
                         ungapped_translated = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "protein2dna" | "p2d" => {
                         model = Model::Local;
-                        query_type = "protein".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "protein".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "protein2dna:bestfit" | "p2d:b" => {
                         model = Model::BestFit;
-                        query_type = "protein".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "protein".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "protein2genome:bestfit" | "p2g:b" => {
                         protein2genome_bestfit = true;
-                        query_type = "protein".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "protein".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "protein2genome" | "p2g" => {
                         protein2genome = true;
-                        query_type = "protein".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "protein".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "genome2genome" | "g2g" => {
                         genome2genome = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "cdna2genome" | "cd2g" => {
                         cdna2genome = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "coding2genome" | "c2g" => {
                         coding2genome = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "coding2coding" | "c2c" => {
                         coding2coding = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "ner" => {
                         ner = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     "est2genome" | "e2g" => {
                         est2genome = true;
-                        query_type = "dna".to_owned();
-                        target_type = "dna".to_owned();
+                        if !query_type_explicit {
+                            query_type = "dna".to_owned();
+                        }
+                        if !target_type_explicit {
+                            target_type = "dna".to_owned();
+                        }
                     }
                     _ => {
                         model = selected
@@ -2294,6 +2419,10 @@ fn run() -> Result<(), String> {
     if files.len() != 2 {
         return Err("exactly QUERY.fa and TARGET.fa are required".into());
     }
+    validate_output_paths(
+        &[&files[0], &files[1]],
+        &[result_tsv.as_deref(), evidence_gff3.as_deref()],
+    )?;
     if intron.min_len > intron.max_len {
         return Err("minimum intron length must not exceed maximum intron length".into());
     }
@@ -2512,7 +2641,13 @@ fn run() -> Result<(), String> {
         } else if est2genome {
             align_est2genome_database_suboptimal(&q, &t, intron, min_score.unwrap_or(100), both)
         } else if coding2coding {
-            align_coding2coding_database_suboptimal(&q, &t, scoring, min_score.unwrap_or(100))
+            align_coding2coding_database_suboptimal_stranded(
+                &q,
+                &t,
+                scoring,
+                min_score.unwrap_or(100),
+                both,
+            )
         } else if genome2genome {
             align_genome_to_genome_database_suboptimal_stranded(
                 &q,
@@ -2607,7 +2742,7 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?
     } else if coding2coding {
-        align_coding2coding_database(&q, &t, scoring)
+        align_coding2coding_database_stranded(&q, &t, scoring, both)
     } else if genome2genome {
         if exhaustive {
             align_genome_to_genome_database_stranded(&q, &t, scoring, intron, both, dp_memory_mb)
@@ -2658,8 +2793,15 @@ fn run() -> Result<(), String> {
                 dp_memory_mb,
             )
         } else {
-            align_protein_to_genome_bestfit_database_heuristic(
-                &q, &t, scoring, intron, both, heuristic,
+            align_protein_to_genome_database_heuristic_with_dp_memory(
+                &q,
+                &t,
+                scoring,
+                intron,
+                both,
+                heuristic,
+                true,
+                dp_memory_mb,
             )
         }
     } else if protein2genome {
@@ -2674,13 +2816,29 @@ fn run() -> Result<(), String> {
                 dp_memory_mb,
             )
         } else {
-            align_protein_to_genome_database_heuristic(&q, &t, scoring, intron, both, heuristic)
+            align_protein_to_genome_database_heuristic_with_dp_memory(
+                &q,
+                &t,
+                scoring,
+                intron,
+                both,
+                heuristic,
+                false,
+                dp_memory_mb,
+            )
         }
     } else if est2genome {
         if exhaustive {
             align_est2genome_database_with_dp_memory(&q, &t, intron, both, dp_memory_mb)
         } else {
-            align_est2genome_database_heuristic(&q, &t, intron, both, heuristic)
+            align_est2genome_database_heuristic_with_dp_memory(
+                &q,
+                &t,
+                intron,
+                both,
+                heuristic,
+                dp_memory_mb,
+            )
         }
     } else {
         match (query_type.as_str(), target_type.as_str()) {
@@ -2757,26 +2915,6 @@ fn run() -> Result<(), String> {
             }
         });
     }
-    if !forward_coordinates {
-        let query_lengths: HashMap<_, _> = q
-            .iter()
-            .map(|sequence| (sequence.id.as_str(), sequence.bases.len() as u64))
-            .collect();
-        for alignment in &mut alignments {
-            if alignment.query_strand == Strand::Reverse {
-                let length = query_lengths
-                    .get(alignment.query_id.as_str())
-                    .copied()
-                    .expect("alignment query comes from the input database");
-                alignment.query_start = length - alignment.query_start;
-                alignment.query_end = length - alignment.query_end;
-            }
-            if alignment.target_strand == Strand::Reverse {
-                alignment.target_start = alignment.target_len - alignment.target_start;
-                alignment.target_end = alignment.target_len - alignment.target_end;
-            }
-        }
-    }
     let report_model = if ungapped_translated {
         "ungapped:trans".to_owned()
     } else if ner {
@@ -2809,6 +2947,30 @@ fn run() -> Result<(), String> {
         };
         format!("{base}:{query_type}2{target_type}")
     };
+    if let Some(path) = &evidence_gff3 {
+        write_evidence_gff3(path, &alignments, task_id.as_deref(), best_n)?;
+    }
+    let canonical_alignments = (!forward_coordinates).then(|| alignments.clone());
+    if !forward_coordinates {
+        let query_lengths: HashMap<_, _> = q
+            .iter()
+            .map(|sequence| (sequence.id.as_str(), sequence.bases.len() as u64))
+            .collect();
+        for alignment in &mut alignments {
+            if alignment.query_strand == Strand::Reverse {
+                let length = query_lengths
+                    .get(alignment.query_id.as_str())
+                    .copied()
+                    .expect("alignment query comes from the input database");
+                alignment.query_start = length - alignment.query_start;
+                alignment.query_end = length - alignment.query_end;
+            }
+            if alignment.target_strand == Strand::Reverse {
+                alignment.target_start = alignment.target_len - alignment.target_start;
+                alignment.target_end = alignment.target_len - alignment.target_end;
+            }
+        }
+    }
     if let Some(path) = &result_tsv {
         write_result_tsv(
             path,
@@ -2820,11 +2982,11 @@ fn run() -> Result<(), String> {
             best_n,
         )?;
     }
-    if let Some(path) = &evidence_gff3 {
-        write_evidence_gff3(path, &alignments, task_id.as_deref(), best_n)?;
-    }
     let mut output_ranks: HashMap<String, usize> = HashMap::new();
-    for a in alignments {
+    for (index, a) in alignments.into_iter().enumerate() {
+        let canonical = canonical_alignments
+            .as_ref()
+            .map_or(&a, |values| &values[index]);
         let rank = output_ranks.entry(a.query_id.clone()).or_default();
         *rank += 1;
         if show_alignment {
@@ -2832,7 +2994,10 @@ fn run() -> Result<(), String> {
                 q.iter().find(|sequence| sequence.id == a.query_id),
                 t.iter().find(|sequence| sequence.id == a.target_id),
             ) {
-                write_stdout(&pretty_alignment(&a, query, target, &report_model), false)?;
+                write_stdout(
+                    &pretty_alignment(canonical, query, target, &report_model, forward_coordinates),
+                    false,
+                )?;
             }
         }
         if sugar {
@@ -2850,10 +3015,16 @@ fn run() -> Result<(), String> {
             write_stdout(&a.vulgar(), true)?
         }
         if gff {
-            write_stdout(&a.gff3(), true)?
+            let report = canonical.gff3_with_id(&format!("target_alignment.{}", index + 1));
+            if !report.is_empty() {
+                write_stdout(&report, true)?;
+            }
         }
         if query_gff {
-            write_stdout(&a.query_gff3(), true)?
+            let report = canonical.query_gff3_with_id(&format!("query_alignment.{}", index + 1));
+            if !report.is_empty() {
+                write_stdout(&report, true)?;
+            }
         }
         if let Some(format) = &ryo {
             let query = q

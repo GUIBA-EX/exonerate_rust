@@ -1,0 +1,29 @@
+vulgar: q 0 18 + t 0 18 + 30 M 5 5 N 8 8 M 5 5
+start to match|0|0|0
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match to ner|-20|1|1
+ner loop insert|0|1|0
+ner loop insert|0|1|0
+ner loop insert|0|1|0
+ner loop insert|0|1|0
+ner loop insert|0|1|0
+ner loop insert|0|1|0
+ner loop insert|0|1|0
+ner loop delete|0|0|1
+ner loop delete|0|0|1
+ner loop delete|0|0|1
+ner loop delete|0|0|1
+ner loop delete|0|0|1
+ner loop delete|0|0|1
+ner loop delete|0|0|1
+ner to match|0|0|0
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0

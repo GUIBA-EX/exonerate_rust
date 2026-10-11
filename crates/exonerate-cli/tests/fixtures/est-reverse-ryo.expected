@@ -1,0 +1,151 @@
+start to match reverse|0|0|0
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+(START) to intron reverse|-27|0|2
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+target intron loop reverse|0|0|1
+intron reverse to (END)|6|0|2
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match reverse|5|1|1
+match to end reverse|0|0|0

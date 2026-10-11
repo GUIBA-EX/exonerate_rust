@@ -1,0 +1,296 @@
+{
+  "date": "2026-10-11",
+  "reference": "repository upstream Exonerate 2.4.0",
+  "audits": [
+    {
+      "seed": 711,
+      "cases_per_suite": 16,
+      "ambiguous": false,
+      "summary": {
+        "ungapped": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:trans": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ner": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "est2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna:bestfit": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome:bestfit": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2coding": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "cdna2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "genome2genome": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap:protein2protein": {
+          "cases": 16,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        }
+      },
+      "failures": []
+    },
+    {
+      "seed": 42,
+      "cases_per_suite": 32,
+      "ambiguous": true,
+      "summary": {
+        "ungapped": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:trans": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ner": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "est2genome": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2dna:bestfit": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "protein2genome:bestfit": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2coding": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "coding2genome": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "cdna2genome": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "genome2genome": {
+          "cases": 64,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "ungapped:protein2protein": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:global:protein2protein": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:bestfit:protein2protein": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:local:protein2protein": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        },
+        "affine:overlap:protein2protein": {
+          "cases": 32,
+          "upstream_differences": 0,
+          "checkpoint_differences": 0,
+          "execution_errors": 0
+        }
+      },
+      "failures": []
+    }
+  ],
+  "translation_oracle": {
+    "source": "upstream/src/sequence/translate.c:Translate_create(FALSE), Translate_codon",
+    "alphabet": "-ACGTRYSWKMBDHVNXU",
+    "codons": 5832,
+    "case_variants": [
+      "uppercase",
+      "lowercase"
+    ],
+    "fixture": "crates/exonerate-cli/tests/fixtures/iupac_translation.expected"
+  },
+  "regression_tests": 208,
+  "checks": [
+    "hard-linked input and report protection on Unix",
+    "batch GFF3 unique IDs and valid Parent references",
+    "reverse query pretty coordinates and sequence preservation",
+    "protein2dna A / GCN upstream hit",
+    "all IUPAC codons against original translation table",
+    "formatting",
+    "clippy -D warnings",
+    "doc tests",
+    "documentation -D warnings"
+  ]
+}
