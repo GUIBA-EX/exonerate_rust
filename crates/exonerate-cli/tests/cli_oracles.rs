@@ -3941,3 +3941,87 @@ fn seeded_splice_phases_frameshifts_and_raw_steps_match_upstream() {
     }
     fs::remove_dir_all(directory).unwrap();
 }
+
+#[test]
+fn genome_post_coding_gap_ties_and_raw_steps_match_upstream() {
+    let query = fixture("genome-tied-query.fa");
+    let target = fixture("genome-tied-target.fa");
+    for memory in ["0", "64"] {
+        let output = run(&[
+            "--model",
+            "genome2genome",
+            "--exhaustive",
+            "yes",
+            "--subopt",
+            "no",
+            "--revcomp",
+            "yes",
+            "--score",
+            "1",
+            "--showalignment",
+            "no",
+            "--showsugar",
+            "yes",
+            "--showcigar",
+            "yes",
+            "--showvulgar",
+            "yes",
+            "--ryo",
+            "{%Pn|%Ps|%Pqa|%Pta\\n}",
+            "--dpmemory",
+            memory,
+            query.to_str().unwrap(),
+            target.to_str().unwrap(),
+        ]);
+        assert_eq!(
+            output,
+            include_str!("fixtures/genome-tied-raw.expected"),
+            "memory {memory}"
+        );
+    }
+}
+
+#[test]
+fn genome_coding_entry_exit_raw_steps_match_upstream() {
+    let directory = test_directory("genome-raw-boundaries");
+    let query = directory.join("q.fa");
+    let target = directory.join("t.fa");
+    for line in include_str!("fixtures/genome-raw-boundaries.tsv")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+    {
+        let fields: Vec<_> = line.split('\t').collect();
+        fs::write(&query, format!(">q\n{}\n", fields[0])).unwrap();
+        fs::write(&target, format!(">t\n{}\n", fields[1])).unwrap();
+        for memory in ["0", "64"] {
+            let output = run(&[
+                "--model",
+                "genome2genome",
+                "--exhaustive",
+                "yes",
+                "--subopt",
+                "no",
+                "--revcomp",
+                "yes",
+                "--score",
+                "1",
+                "--showalignment",
+                "no",
+                "--showsugar",
+                "yes",
+                "--showcigar",
+                "yes",
+                "--showvulgar",
+                "yes",
+                "--ryo",
+                "{%Pn|%Ps|%Pqa|%Pta\\n}",
+                "--dpmemory",
+                memory,
+                query.to_str().unwrap(),
+                target.to_str().unwrap(),
+            ]);
+            assert_eq!(output, fields[2].replace("\\n", "\n"), "memory {memory}");
+        }
+    }
+    fs::remove_dir_all(directory).unwrap();
+}

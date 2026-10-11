@@ -1,0 +1,16 @@
+{
+  "seed": 711,
+  "cases_per_suite": 200,
+  "ambiguous": true,
+  "heuristic": false,
+  "raw_steps": true,
+  "summary": {
+    "genome2genome": {
+      "cases": 400,
+      "upstream_differences": 0,
+      "checkpoint_differences": 0,
+      "execution_errors": 0
+    }
+  },
+  "failures": []
+}

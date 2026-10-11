@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--ambiguous", action="store_true", help="include N and lengths 1–64 for translation boundary checks")
     parser.add_argument("--heuristic", action="store_true", help="audit default seeded EST/protein spliced extension")
     parser.add_argument("--raw-steps", action="store_true", help="compare atomic RYO transition names and scores as well")
+    parser.add_argument("--models", nargs="+", choices=MODELS, help="restrict the audit to selected models")
     options = parser.parse_args()
     if options.cases < 1 or options.timeout <= 0:
         parser.error("cases and timeout must be positive")
@@ -61,6 +62,8 @@ def main():
     suites += [(model, True) for model in MODELS if model == "ungapped" or model.startswith("affine:")]
     if options.heuristic:
         suites = [(model, False) for model in ("est2genome", "protein2genome")]
+    if options.models:
+        suites = [(model, protein) for model, protein in suites if model in options.models]
     with tempfile.TemporaryDirectory(prefix="exonerate-audit-") as directory:
         query_path, target_path = pathlib.Path(directory) / "q.fa", pathlib.Path(directory) / "t.fa"
         for model, protein_pair in suites:

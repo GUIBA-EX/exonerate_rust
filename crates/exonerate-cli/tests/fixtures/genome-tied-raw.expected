@@ -1,0 +1,194 @@
+sugar: q 0 60 + t 2 64 + 205
+cigar: q 0 60 + t 2 64 + 205  M 27 M 6 D 2 M 27
+vulgar: q 0 60 + t 2 64 + 205 M 27 27 C 6 6 G 0 2 M 27 27
+start to match|0|0|0
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0
+match|-1|3|3
+match|0|3|3
+start to match|0|0|0
+match to delete|-12|0|1
+delete|-4|0|1
+delete to match|0|0|0
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0
+sugar: q 1 27 + t 29 3 - 52
+cigar: q 1 27 + t 29 3 - 52  M 11 M 3 M 12
+vulgar: q 1 27 + t 29 3 - 52 M 11 11 C 3 3 M 12 12
+start to match|0|0|0
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0
+match|-1|3|3
+start to match|0|0|0
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match to end|0|0|0
+sugar: q 27 1 - t 3 29 + 52
+cigar: q 27 1 - t 3 29 + 52  M 11 M 3 M 12
+vulgar: q 27 1 - t 3 29 + 52 M 11 11 C 3 3 M 12 12
+start to match|0|0|0
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0
+match|-1|3|3
+start to match|0|0|0
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-2|1|1
+match|-2|1|1
+match|5|1|1
+match to end|0|0|0
+sugar: q 60 0 - t 64 2 - 204
+cigar: q 60 0 - t 64 2 - 204  M 27 M 6 D 2 M 27
+vulgar: q 60 0 - t 64 2 - 204 M 27 27 C 6 6 G 0 2 M 27 27
+start to match|0|0|0
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0
+match|-1|3|3
+match|-1|3|3
+start to match|0|0|0
+match to delete|-12|0|1
+delete|-4|0|1
+delete to match|0|0|0
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|5|1|1
+match|-1|1|1
+match|-1|1|1
+match|5|1|1
+match|5|1|1
+match to end|0|0|0

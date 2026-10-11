@@ -50,3 +50,5 @@ transition 等价性。
 
 默认 SDP 启发式另固定 25 个原版案例，覆盖剪接相位、移码、反向 target 和 maxintron 边界；包含原子 RYO 名称／分值，0/64 MiB 配置均验证。
 后续 24 组真实数据严格验收已通过，完整证据见 `docs/audit/real-data/sdp-final/results.json`；限制见兼容性文档第二阶段。
+
+后续补齐 genome2genome 编码区前后边界和反向同分路径的 4 个固定原版反例，比较完整 sugar/cigar/vulgar 及原子 RYO；0/64 MiB 配置均验证。1,184 组全模型差分和 400 组 genome2genome 原子差分均通过，详见兼容性文档后续修复章节。

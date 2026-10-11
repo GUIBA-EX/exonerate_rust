@@ -8977,11 +8977,38 @@ fn genome_raw_fragment(
         .flatten()
         .collect::<Vec<_>>();
     if atoms.is_empty() {
-        return vec![RawStep {
-            transition_id: if destination == GenomeState::UtrM && parent.state == GenomeState::UtrI
+        let mut raw = Vec::new();
+        let close = if genome_state_is_coding(destination) {
+            match parent.state {
+                GenomeState::UtrI => Some(35),
+                GenomeState::UtrD => Some(36),
+                _ => None,
+            }
+        } else if destination == GenomeState::U3M {
+            match parent.state {
+                GenomeState::CdsI => Some(59),
+                GenomeState::CdsD => Some(79),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(transition_id) = close {
+            raw.push(RawStep {
+                transition_id,
+                query_advance: 0,
+                target_advance: 0,
+                score: 0,
+            });
+        }
+        raw.push(RawStep {
+            transition_id: if matches!(destination, GenomeState::UtrM | GenomeState::U3M)
+                && matches!(parent.state, GenomeState::UtrI | GenomeState::U3I)
             {
                 35
-            } else if destination == GenomeState::UtrM && parent.state == GenomeState::UtrD {
+            } else if matches!(destination, GenomeState::UtrM | GenomeState::U3M)
+                && matches!(parent.state, GenomeState::UtrD | GenomeState::U3D)
+            {
                 36
             } else if genome_state_is_coding(destination) {
                 50
@@ -8991,7 +9018,8 @@ fn genome_raw_fragment(
             query_advance: 0,
             target_advance: 0,
             score: 0,
-        }];
+        });
+        return raw;
     }
 
     let first_id = atoms
@@ -9154,10 +9182,13 @@ fn genome_raw_fragment(
 
     let run = atoms[0];
     let mut raw = Vec::new();
-    if matches!(destination, GenomeState::UtrM | GenomeState::CdsM) {
+    if matches!(
+        destination,
+        GenomeState::UtrM | GenomeState::CdsM | GenomeState::U3M
+    ) {
         let close_id = match parent.state {
-            GenomeState::UtrI => Some(35),
-            GenomeState::UtrD => Some(36),
+            GenomeState::UtrI | GenomeState::U3I => Some(35),
+            GenomeState::UtrD | GenomeState::U3D => Some(36),
             GenomeState::CdsI => Some(59),
             GenomeState::CdsD => Some(79),
             _ => None,
@@ -10769,6 +10800,23 @@ fn align_genome_to_genome_forbidden(
                     }),
                 );
             }
+            // In C4_Model_close order, post-CDS gap returns precede the
+            // CDS-to-UTR epsilon edge. Prefer that existing gap path on a tie.
+            let coding_exit = pu3m[k].is_some_and(|p| {
+                genome_state_is_coding(p.state) && p.fragment.advances() == (0, 0)
+            });
+            let (gap_score, gap_state) = best(&[(u3i[k], State::I), (u3d[k], State::D)]);
+            if gap_score > u3m[k] || (gap_score == u3m[k] && coding_exit) {
+                u3m[k] = gap_score;
+                pu3m[k] = Some(GenomeParent {
+                    state: if gap_state == State::I {
+                        GenomeState::U3I
+                    } else {
+                        GenomeState::U3D
+                    },
+                    fragment: CompactGenomeFragment::from_trace_fragment(TraceFragment::empty()),
+                });
+            }
             for (value, state) in [
                 (mat[k], GenomeState::UtrM),
                 (ins[k], GenomeState::UtrI),
@@ -10907,12 +10955,22 @@ fn align_genome_to_genome_forbidden(
         target_advance: 0,
         score: 0,
     });
-    raw_trace.push(RawStep {
-        transition_id: 90,
-        query_advance: 0,
-        target_advance: 0,
-        score: 0,
-    });
+    // A pre-CDS UTR path must pass through the coding state to reach END.
+    // Coding and post-CDS UTR paths already reached their terminal edge above.
+    if matches!(
+        final_state,
+        GenomeState::UtrM | GenomeState::UtrI | GenomeState::UtrD
+    ) {
+        raw_trace.push(RawStep {
+            transition_id: 90,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    if replay_checkpoint.is_none() && parent_rows.is_none() {
+        genome_normalize_raw_start(&mut raw_trace);
+    }
     Alignment {
         query_id: query.id.clone(),
         target_id: target.id.clone(),
@@ -11013,7 +11071,11 @@ fn align_genome_to_genome_checkpointed(
             1,
             Some(checkpoint),
         );
-        let terminal_len = 2 + usize::from(genome_terminal_transition(cursor.2).is_some());
+        let terminal_len =
+            1 + usize::from(matches!(
+                cursor.2,
+                GenomeState::UtrM | GenomeState::UtrI | GenomeState::UtrD
+            )) + usize::from(genome_terminal_transition(cursor.2).is_some());
         debug_assert!(segment.raw_trace.len() > terminal_len);
         trace_segments.push(segment.trace);
         raw_segments.push(segment.raw_trace[1..segment.raw_trace.len() - terminal_len].to_vec());
@@ -11055,12 +11117,20 @@ fn align_genome_to_genome_checkpointed(
         target_advance: 0,
         score: 0,
     });
-    raw_trace.push(RawStep {
-        transition_id: 90,
-        query_advance: 0,
-        target_advance: 0,
-        score: 0,
-    });
+    // A pre-CDS UTR path must pass through the coding state to reach END.
+    // Coding and post-CDS UTR paths already reached their terminal edge above.
+    if matches!(
+        final_state,
+        GenomeState::UtrM | GenomeState::UtrI | GenomeState::UtrD
+    ) {
+        raw_trace.push(RawStep {
+            transition_id: 90,
+            query_advance: 0,
+            target_advance: 0,
+            score: 0,
+        });
+    }
+    genome_normalize_raw_start(&mut raw_trace);
     Alignment {
         query_id: query.id.clone(),
         target_id: target.id.clone(),
@@ -11074,6 +11144,13 @@ fn align_genome_to_genome_checkpointed(
         score: endpoint.score,
         raw_trace,
         trace,
+    }
+}
+
+// C4's direct start-to-CDS edge wins over an empty pre-CDS UTR route.
+fn genome_normalize_raw_start(raw: &mut Vec<RawStep>) {
+    if raw.get(1).is_some_and(|step| step.transition_id == 50) {
+        raw.remove(1);
     }
 }
 

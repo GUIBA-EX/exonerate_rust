@@ -240,3 +240,19 @@ python3 scripts/audit_compatibility.py --rust target/release/exonerate-rs --heur
 8 个真实 protein2dna / bestfit 案例，每个配置重复五次，共 120 次执行；全部输出一致，普通及低内存配置均快于原版，见 [原版对比](docs/audit/real-data/packed-trace/results.json)。另外对本次修改前后可执行文件交替运行五轮，共 80 次执行，8 组全部结果一致且中位耗时降低；保存二进制哈希、每次命令与结果，见 [修改前后交替对比](docs/audit/real-data/packed-trace/paired.json)。
 
 hTRT bestfit 修改前后中位耗时从 0.218775 s 降至 0.180416 s，降低约 17.5%；峰值 RSS 的中位数从 83,104 KiB 降至 16,776 KiB，降低约 79.8%。单独的原版对比中，原版为 0.225049 s，Rust 64 MiB 为 0.186163 s。两轮测量分别报告，不混用其时间计算收益。8 组修改前后加速比为 1.13–1.21×；结论仍限于这批数据和本机测量。
+
+
+## genome2genome 同分路径与逐步骤报告修复（v0.2.1 之后）
+
+修复第三阶段保留的反向同分路径差异。原版 `C4_Model_close` 的 transition 顺序先处理 post-CDS 间隙返回，再处理 CDS-to-UTR 空转移；本实现现在保留该优先级。原版与 Rust 均得到 204 分，反向路径统一为 `M 27 27 C 6 6 G 0 2 M 27 27`。
+
+逐步骤 RYO 同步修正：post-CDS 入口使用 `start to match` 名称，补齐间隙闭合步骤，删除重复终止步骤及空 pre-CDS 前缀；checkpoint 按实际终止步骤数截取回放片段，避免丢失末尾匹配。四个原版反例固定为回归案例，在 0/64 MiB 配置下比较完整报告。
+
+验证：216 项回归测试、严格 Clippy、格式及文档检查通过。原来的 1,184 组差分现在零原版差异、零内存配置差异、零执行错误，见 [完整复测](docs/audit/genome-tie-validation.json)。另增加 400 组 genome2genome 原子 RYO 差分，全部一致，见 [逐步骤复测](docs/audit/genome-raw-validated.json)。保留 [修复前逐步骤反例](docs/audit/genome-raw-validation.json) 供追溯。
+
+```sh
+python3 scripts/audit_compatibility.py --rust target/release/exonerate-rs --cases 32 --ambiguous --output /tmp/genome-tie.json
+python3 scripts/audit_compatibility.py --rust target/release/exonerate-rs --models genome2genome --cases 200 --ambiguous --raw-steps --output /tmp/genome-raw.json
+```
+
+以上修复位于 v0.2.1 之后，已发布的 v0.2.1 内容不变。此次是正确性修复，没有新增全基因组性能保证。
